@@ -37,6 +37,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from site_proxy import ClientSiteMiddleware, registry_path as client_sites_registry
 from trial_gate import (
     TrialGateMiddleware,
     configured_model,
@@ -4902,7 +4903,10 @@ app = Starlette(
     routes=routes,
     lifespan=_lifespan,
     middleware=[
-        # Outermost: an expired trial refuses /api/* (402) and /ws/* (4402).
+        # Outermost: registered client business sites (/site/<slug>/ and their
+        # own domains) are proxied to 127.0.0.1:<port>; see site_proxy.py.
+        Middleware(ClientSiteMiddleware, expired_fn=is_expired_trial),
+        # An expired trial refuses /api/* (402) and /ws/* (4402).
         Middleware(TrialGateMiddleware),
         Middleware(
             CORSMiddleware,
@@ -4927,4 +4931,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8097))
     print(f"[portal] Starting yourAICIV portal on port {port}")
     print(f"[portal] Bearer token: stored in {TOKEN_FILE}")
+    print(f"[portal] Client sites: /site/<slug>/ from {client_sites_registry()}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

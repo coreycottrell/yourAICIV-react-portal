@@ -12,6 +12,7 @@ It is one small Python server plus a React app. Each AI runs its own copy.
 yourAICIV-react-portal/
 ├── portal_server.py     Python/Starlette backend: serves the app + /api + /ws
 ├── trial_gate.py        Trial contract: reads config/trial.json, enforces expiry
+├── site_proxy.py        Publishes client business sites at /site/<slug>/
 ├── start.sh             Launcher
 ├── requirements.txt     Python dependencies
 ├── tests/               Backend tests (pytest)
@@ -80,6 +81,43 @@ paths: `/api/panes`, `/api/inject/pane`, `/api/resume`, `/api/browser/*`,
 
 Business websites built for a client have their own `/admin` dashboard. This
 portal deliberately has no "Clients" tab.
+
+---
+
+## Client business sites (`/site/<slug>/`)
+
+The AI builds client business sites with the birth template's delivery
+engine. Each one listens on `127.0.0.1:<port>` only. This portal publishes
+them through its own public address, so a site is live the moment the AI
+starts and registers it, with no new DNS, tunnel or proxy config:
+
+```
+https://<portal address>/site/<slug>/     -> http://127.0.0.1:<port>/
+https://<client's own domain>/            -> same site (after the domain points here)
+```
+
+- **Registry.** `~/.client-sites.json` (override: `CLIENT_SITES_FILE`),
+  written by the template's `tools/client_sites.py`. Re-read whenever it
+  changes; no restart. Only registered slugs are served, and only ever to
+  `127.0.0.1`.
+- **Public by design.** No access code is needed and the portal never
+  forwards its own `Authorization` header. The site's `/admin` is protected
+  by the site's own login.
+- **Headers.** The portal sends `X-Forwarded-Prefix: /site/<slug>`,
+  `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-For` (the
+  right-most entry from the TLS proxy in front, else the TCP peer). The
+  site trusts these from loopback only.
+- **Custom domain.** A request whose `Host` is listed in a site's `domains`
+  goes to that site at its root (all paths, including `/api/*`). Needs DNS
+  for the domain pointed at this portal's address and a TLS proxy entry for
+  it, like the portal's own.
+- **Trial.** While the trial is expired (or its record is untrusted), every
+  client site answers `503` with a neutral "temporarily unavailable" page.
+  Nothing is stopped or deleted.
+- **Down site.** `502` with the same neutral page; the template's watchdog
+  restarts registered sites within a minute.
+- Sites under `/site/` share this portal's origin. For full isolation, give a
+  site its own domain (above).
 
 ---
 
@@ -194,6 +232,7 @@ environment or in `~/.env` (`KEY=value` lines).
 | `AGENTSHEETS_URL`, `AGENTSHEETS_API_KEY` | Sheets service |
 | `AGENTAUTH_URL`, `AGENTAUTH_PRIVATE_KEY`, `AGENTAUTH_PUBLIC_KEY` | Service sign-in for Docs/Sheets (optional) |
 | `BROWSER_URL` | Browser-view service (default `http://localhost:8099`) |
+| `CLIENT_SITES_FILE` | Client-site registry (default `~/.client-sites.json`); see Client business sites |
 
 Build-time (set in `react-portal/.env.local` before `npm run build`):
 
