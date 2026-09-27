@@ -379,7 +379,12 @@ def _find_all_project_jsonl():
 def _get_all_session_log_paths(max_files=3):
     """Get paths to recent JSONL session logs across ALL project directories, ordered oldest-first.
     Reduced from 10 to 3 files for performance — parsing 10x 50-97MB files every 0.8s was burning 66% CPU."""
-    logs = _find_all_project_jsonl()
+    # Chat reads only THIS civ's own project dir (derived from $HOME, e.g. /home/aiciv ->
+    # -home-aiciv). Other project dirs hold headless sessions run from worktrees/tools
+    # (plugins, SDK runs, isolated workflow agents) whose "user" turns are tool prompts,
+    # never the human; reading them made tool prompts appear as the human.
+    own = "-" + str(Path.home()).strip("/").replace("/", "-")
+    logs = [p for p in _find_all_project_jsonl() if Path(p).parent.name == own]
     return list(reversed(logs[:max_files]))
 
 
