@@ -1,0 +1,884 @@
+/* ===== Org Chart Tree View ===== */
+
+.oct-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow-y: auto;
+  padding: 24px;
+  gap: 20px;
+}
+
+/* ── Scrollbar ─────────────────────────────────────────── */
+
+.oct-container::-webkit-scrollbar {
+  width: 6px;
+}
+
+.oct-container::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.oct-container::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 3px;
+}
+
+/* ── Header ────────────────────────────────────────────── */
+
+.oct-header {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  flex-shrink: 0;
+}
+
+.oct-header-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.oct-title {
+  font-family: var(--font-display);
+  font-size: 28px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+/* ── Stats row ─────────────────────────────────────────── */
+
+.oct-stats-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.oct-stat {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.oct-stat-value {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.oct-stat-label {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.oct-stat-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.oct-stat-divider {
+  width: 1px;
+  height: 16px;
+  background: var(--border-subtle);
+}
+
+/* ── Legend ─────────────────────────────────────────────── */
+
+.oct-legend {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+}
+
+.oct-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.oct-legend-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.oct-legend-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-weight: 500;
+  text-transform: capitalize;
+}
+
+/* ── Controls ──────────────────────────────────────────── */
+
+.oct-controls {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.oct-search-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 200px;
+  max-width: 400px;
+}
+
+.oct-search-icon {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-tertiary);
+  pointer-events: none;
+}
+
+.oct-search {
+  width: 100%;
+  padding: 8px 36px 8px 36px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: var(--font-sans);
+  outline: none;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.oct-search::placeholder {
+  color: var(--text-tertiary);
+}
+
+.oct-search:focus {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 3px var(--accent-primary-bg);
+}
+
+.oct-search-clear {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  transition: color var(--transition-fast);
+}
+
+.oct-search-clear:hover {
+  color: var(--text-primary);
+}
+
+/* ── Filter chips ──────────────────────────────────────── */
+
+.oct-filters {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.oct-filter-chip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-family: var(--font-sans);
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  white-space: nowrap;
+}
+
+.oct-filter-chip:hover {
+  border-color: var(--border-default);
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.oct-filter-chip--active {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+  background: var(--accent-primary-bg);
+}
+
+.oct-filter-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* ── Quickfire buttons ─────────────────────────────────── */
+
+.oct-quickfire {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.oct-quickfire-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.oct-quickfire-btn:hover {
+  background: var(--bg-tertiary);
+  border-color: var(--accent-primary);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-sm);
+}
+
+.oct-quickfire-icon {
+  font-size: 16px;
+}
+
+.oct-quickfire-label {
+  font-size: 13px;
+}
+
+/* ── Loading / Empty ───────────────────────────────────── */
+
+.oct-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 80px 20px;
+  color: var(--text-tertiary);
+  font-size: 14px;
+}
+
+.oct-spinner {
+  width: 32px;
+  height: 32px;
+  border: 2.5px solid var(--border-subtle);
+  border-top-color: var(--accent-primary);
+  border-radius: 50%;
+  animation: oct-spin 0.8s linear infinite;
+}
+
+@keyframes oct-spin {
+  to { transform: rotate(360deg); }
+}
+
+.oct-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 80px 20px;
+  color: var(--text-tertiary);
+  font-size: 14px;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   TREE HIERARCHY LAYOUT
+   ═══════════════════════════════════════════════════════════ */
+
+.oct-tree {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+  padding: 20px 0 40px;
+  min-width: 0;
+}
+
+/* ── Rows ──────────────────────────────────────────────── */
+
+.oct-row {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  gap: 24px;
+  width: 100%;
+  flex-wrap: wrap;
+}
+
+.oct-row--center {
+  flex-direction: column;
+  align-items: center;
+}
+
+.oct-row--l2 {
+  position: relative;
+  gap: 0;
+  flex-wrap: nowrap;
+  justify-content: center;
+  align-items: center;
+}
+
+.oct-row--l3 {
+  gap: 48px;
+  justify-content: center;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.oct-row--l4 {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 16px;
+  max-width: 1200px;
+}
+
+.oct-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.oct-col--center {
+  align-items: center;
+}
+
+/* ── Vertical stems ────────────────────────────────────── */
+
+.oct-stem-down {
+  width: 2px;
+  height: 32px;
+  background: var(--border-subtle);
+  flex-shrink: 0;
+}
+
+.oct-stem-down--short {
+  height: 20px;
+}
+
+/* ── Horizontal bar between L2 siblings ────────────────── */
+
+.oct-hbar {
+  width: 80px;
+  height: 2px;
+  background: var(--border-subtle);
+  flex-shrink: 0;
+  align-self: center;
+}
+
+/* ── Subtree wrapper ───────────────────────────────────── */
+
+.oct-subtree {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+}
+
+/* ── Tech team groups (dashed boxes) ───────────────────── */
+
+.oct-tech-groups {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.oct-tech-team-group {
+  border: 1.5px dashed var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  min-width: 180px;
+  background: var(--bg-primary);
+  transition: border-color var(--transition-fast);
+}
+
+.oct-tech-team-group:hover {
+  border-color: var(--border-default);
+}
+
+.oct-tech-team-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-tertiary);
+  padding: 2px 10px;
+  background: var(--bg-elevated);
+  border-radius: var(--radius-full);
+  white-space: nowrap;
+}
+
+/* ── Marketing groups ──────────────────────────────────── */
+
+.oct-marketing-groups {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+/* ── Level 4 label ─────────────────────────────────────── */
+
+.oct-l4-label {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-tertiary);
+  padding: 4px 14px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  margin: 8px 0;
+}
+
+/* ── Department column ─────────────────────────────────── */
+
+.oct-dept-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   NODE CARDS
+   ═══════════════════════════════════════════════════════════ */
+
+.oct-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 14px 12px 10px;
+  background: var(--surface-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  text-align: center;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast), transform 0.15s ease;
+  position: relative;
+  cursor: default;
+}
+
+.oct-node[role="button"] {
+  cursor: pointer;
+}
+
+.oct-node:hover {
+  border-color: var(--border-default);
+  box-shadow: var(--shadow-md);
+  transform: translateY(-1px);
+}
+
+/* Tier sizing */
+
+.oct-node--primary {
+  width: 130px;
+  min-height: 130px;
+  padding: 18px 14px 12px;
+  border-width: 2px;
+  border-color: #f1420b44;
+  background: var(--bg-elevated);
+}
+
+.oct-node--primary:hover {
+  border-color: #f1420b88;
+  box-shadow: 0 4px 20px rgba(241, 66, 11, 0.15);
+}
+
+.oct-node--l2 {
+  width: 120px;
+  min-height: 120px;
+  padding: 16px 12px 10px;
+}
+
+.oct-node--dept {
+  width: 140px;
+  min-height: 105px;
+  padding: 12px 10px 8px;
+}
+
+.oct-node--agent {
+  width: 130px;
+  min-height: 95px;
+  padding: 10px 8px 8px;
+  background: var(--bg-primary);
+  border-style: solid;
+  border-color: var(--border-subtle);
+}
+
+.oct-node--agent:hover {
+  background: var(--bg-elevated);
+}
+
+/* ── Avatar ────────────────────────────────────────────── */
+
+.oct-avatar {
+  position: relative;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border: 1.5px solid transparent;
+}
+
+.oct-avatar--primary {
+  width: 52px;
+  height: 52px;
+  box-shadow: 0 2px 12px rgba(241, 66, 11, 0.3);
+}
+
+.oct-avatar--l2 {
+  width: 44px;
+  height: 44px;
+}
+
+.oct-avatar--dept {
+  width: 38px;
+  height: 38px;
+}
+
+.oct-avatar--agent {
+  width: 32px;
+  height: 32px;
+}
+
+.oct-avatar-initials {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.oct-avatar--primary .oct-avatar-initials {
+  font-size: 16px;
+}
+
+.oct-avatar--l2 .oct-avatar-initials {
+  font-size: 14px;
+}
+
+.oct-avatar--dept .oct-avatar-initials {
+  font-size: 12px;
+}
+
+.oct-avatar--agent .oct-avatar-initials {
+  font-size: 11px;
+}
+
+/* ── Status dot ────────────────────────────────────────── */
+
+.oct-status-dot {
+  position: absolute;
+  bottom: -1px;
+  right: -1px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--surface-card);
+}
+
+.oct-avatar--agent .oct-status-dot {
+  width: 8px;
+  height: 8px;
+  border-width: 1.5px;
+}
+
+/* ── Node name ─────────────────────────────────────────── */
+
+.oct-node-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.3;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.oct-node--primary .oct-node-name {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.oct-node--agent .oct-node-name {
+  font-size: 11px;
+}
+
+/* ── Badge ─────────────────────────────────────────────── */
+
+.oct-node-badge {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  color: #fff;
+  line-height: 1.4;
+}
+
+/* ── Task / description text ───────────────────────────── */
+
+.oct-node-task,
+.oct-node-desc {
+  font-size: 10px;
+  color: var(--text-tertiary);
+  line-height: 1.3;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.oct-node-task {
+  color: var(--text-secondary);
+}
+
+/* ── Expand hint ───────────────────────────────────────── */
+
+.oct-expand-hint {
+  font-size: 9px;
+  color: var(--text-tertiary);
+  margin-top: 2px;
+  opacity: 0.7;
+  transition: opacity var(--transition-fast);
+}
+
+.oct-node:hover .oct-expand-hint {
+  opacity: 1;
+}
+
+/* ── Expanded agent list under dept ────────────────────── */
+
+.oct-dept-agents {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding-top: 8px;
+  animation: oct-slide-in 200ms ease-out;
+}
+
+@keyframes oct-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   RESPONSIVE
+   ═══════════════════════════════════════════════════════════ */
+
+@media (max-width: 1024px) {
+  .oct-row--l2 {
+    flex-wrap: wrap;
+  }
+
+  .oct-hbar {
+    width: 40px;
+  }
+
+  .oct-row--l3 {
+    gap: 24px;
+  }
+
+  .oct-tech-groups {
+    gap: 12px;
+  }
+}
+
+@media (max-width: 768px) {
+  .oct-container {
+    padding: 16px;
+    gap: 16px;
+  }
+
+  .oct-title {
+    font-size: 22px;
+  }
+
+  .oct-header-top {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .oct-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .oct-search-wrap {
+    max-width: none;
+  }
+
+  .oct-filters {
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .oct-filters::-webkit-scrollbar {
+    display: none;
+  }
+
+  .oct-row--l2 {
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+  }
+
+  .oct-hbar {
+    width: 2px;
+    height: 20px;
+  }
+
+  .oct-row--l3 {
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .oct-tech-groups {
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .oct-tech-team-group {
+    min-width: 160px;
+    width: 100%;
+    max-width: 300px;
+  }
+
+  .oct-marketing-groups {
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .oct-row--l4 {
+    gap: 12px;
+  }
+
+  .oct-node--primary {
+    width: 110px;
+    min-height: 110px;
+  }
+
+  .oct-node--l2 {
+    width: 100px;
+    min-height: 100px;
+  }
+
+  .oct-node--dept {
+    width: 120px;
+    min-height: 90px;
+  }
+
+  .oct-node--agent {
+    width: 110px;
+    min-height: 85px;
+  }
+
+  .oct-quickfire {
+    gap: 8px;
+  }
+
+  .oct-quickfire-btn {
+    padding: 6px 12px;
+    font-size: 12px;
+  }
+
+  .oct-legend {
+    gap: 10px;
+    padding: 6px 10px;
+  }
+}
+
+@media (max-width: 480px) {
+  .oct-container {
+    padding: 12px;
+    gap: 12px;
+  }
+
+  .oct-row--l4 {
+    gap: 8px;
+  }
+
+  .oct-node--primary {
+    width: 100px;
+    min-height: 100px;
+  }
+
+  .oct-node--dept,
+  .oct-node--agent {
+    width: 100px;
+    min-height: 80px;
+  }
+
+  .oct-tech-team-group {
+    padding: 12px;
+    gap: 8px;
+  }
+}
+
+@media (min-width: 1400px) {
+  .oct-row--l4 {
+    max-width: 1400px;
+    gap: 20px;
+  }
+
+  .oct-hbar {
+    width: 120px;
+  }
+
+  .oct-row--l3 {
+    gap: 64px;
+  }
+}

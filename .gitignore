@@ -1,0 +1,29 @@
+node_modules/
+dist/
+*.db
+*.log
+.portal-token
+.aicivcal-calendar-id
+.agentcal-fired-ids.json
+.env
+__pycache__/
+*.pyc
+.DS_Store
+reaction-sentiment.jsonl
+portal-chat.jsonl
+scheduled_tasks.json
+scheduled_tasks.json.migrated
+*.tmp
+
+# Local Netlify folder
+.netlify
+
+# Python test cache
+.pytest_cache/
+
+# Per-install state and personal data
+portal_owner.json
+portal_uploads/
+agentmail.db
+.env.local
+react-portal/.env.local

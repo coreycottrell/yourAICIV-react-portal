@@ -1,0 +1,133 @@
+.calendar-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.calendar-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.calendar-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.calendar-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.cal-nav-btn {
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  transition: all var(--transition-fast);
+}
+
+.cal-nav-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.cal-title {
+  font-size: 16px;
+  font-weight: 600;
+  min-width: 200px;
+}
+
+.cal-today-btn {
+  padding: 4px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--accent-primary);
+  border: 1px solid var(--accent-primary);
+  border-radius: var(--radius-md);
+  transition: all var(--transition-fast);
+}
+
+.cal-today-btn:hover {
+  background: var(--accent-primary);
+  color: var(--text-on-accent);
+}
+
+.cal-view-toggle {
+  display: flex;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.cal-view-btn {
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  border-right: 1px solid var(--border-default);
+  transition: all var(--transition-fast);
+}
+
+.cal-view-btn:last-child {
+  border-right: none;
+}
+
+.cal-view-btn:hover {
+  background: var(--bg-hover);
+}
+
+.cal-view-btn-active {
+  background: var(--accent-primary-bg);
+  color: var(--accent-primary);
+}
+
+.cal-new-btn {
+  padding: 6px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  background: var(--accent-primary);
+  color: var(--text-on-accent);
+  border-radius: var(--radius-md);
+  transition: background var(--transition-fast);
+}
+
+.cal-new-btn:hover {
+  background: var(--accent-primary-hover);
+}
+
+.calendar-content {
+  flex: 1;
+  overflow: hidden;
+}
+
+.calendar-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+}
+
+@media (max-width: 768px) {
+  .calendar-toolbar {
+    padding: 8px 12px;
+  }
+
+  .cal-title {
+    font-size: 14px;
+    min-width: auto;
+  }
+}

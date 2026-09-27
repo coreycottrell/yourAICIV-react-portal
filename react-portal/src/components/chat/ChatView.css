@@ -1,0 +1,49 @@
+.chat-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.chat-header-bar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 4px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.chat-search-toggle {
+  font-size: 16px;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  color: var(--text-tertiary);
+  transition: all var(--transition-fast);
+}
+
+.chat-search-toggle:hover,
+.chat-search-toggle-active {
+  color: var(--accent-primary);
+  background: var(--bg-hover);
+}
+
+.chat-loading,
+.chat-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow-y: auto;
+}
+
+/* Default: chat-main-area behaves like the old chat-view */
+.chat-main-area {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  flex: 1;
+  min-width: 0;
+}
+
+/* When artifact panel is open, switch to row layout */
+.chat-with-artifact {
+  flex-direction: row;
+}

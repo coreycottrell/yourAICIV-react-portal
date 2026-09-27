@@ -1,0 +1,28 @@
+.brand-mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  line-height: 1;
+}
+
+.brand-glyph {
+  flex-shrink: 0;
+  display: block;
+}
+
+.brand-wordmark {
+  font-family: var(--font-display);
+  font-size: 19px;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.brand-wordmark-prefix {
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.brand-wordmark-suffix {
+  font-weight: 700;
+}

@@ -1,0 +1,107 @@
+.task-modal-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.task-modal-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.task-modal-field label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.task-modal-field textarea {
+  resize: vertical;
+  min-height: 60px;
+}
+
+.task-modal-row {
+  display: flex;
+  gap: 12px;
+}
+
+.task-modal-row .task-modal-field {
+  flex: 1;
+}
+
+.task-modal-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.task-modal-right {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.task-modal-delete {
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--status-error);
+  border-radius: var(--radius-md);
+}
+
+.task-modal-delete:hover {
+  background: var(--status-error-bg);
+}
+
+.task-modal-cancel {
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  border-radius: var(--radius-md);
+}
+
+.task-modal-cancel:hover {
+  background: var(--bg-hover);
+}
+
+.task-modal-save {
+  padding: 8px 20px;
+  font-size: 13px;
+  font-weight: 600;
+  background: var(--accent-primary);
+  color: var(--text-on-accent);
+  border-radius: var(--radius-md);
+  transition: background var(--transition-fast);
+}
+
+.task-modal-save:hover:not(:disabled) {
+  background: var(--accent-primary-hover);
+}
+
+.task-modal-save:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@media (max-width: 768px) {
+  .task-modal-row {
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .task-modal-actions {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .task-modal-save {
+    flex: 1;
+    text-align: center;
+  }
+}

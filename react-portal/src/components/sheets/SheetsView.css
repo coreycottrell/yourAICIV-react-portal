@@ -1,0 +1,532 @@
+/* ── SheetsView Layout ── */
+.sheets-view {
+  display: flex;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* ── Sidebar ── */
+.sheets-sidebar {
+  width: 240px;
+  min-width: 240px;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.sheets-sidebar-header {
+  padding: 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.sheets-sidebar-header h3 {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 0;
+}
+
+.sheets-sidebar-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.sheets-wb-item {
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: 14px;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+
+.sheets-wb-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.sheets-wb-item.active {
+  background: var(--accent-primary-bg);
+  color: var(--accent-primary);
+  font-weight: 500;
+}
+
+.sheets-wb-item .wb-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+.sheets-wb-item .wb-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sheets-wb-delete {
+  opacity: 0;
+  color: var(--text-tertiary);
+  font-size: 16px;
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+  flex-shrink: 0;
+  transition: opacity var(--transition-fast), color var(--transition-fast);
+}
+
+.sheets-wb-item:hover .sheets-wb-delete {
+  opacity: 1;
+}
+
+.sheets-wb-delete:hover {
+  color: var(--status-error);
+  background: var(--status-error-bg);
+}
+
+/* Sheet tabs */
+.sheets-tabs {
+  border-top: 1px solid var(--border-subtle);
+  padding: 8px;
+}
+
+.sheets-tabs-label {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 4px 8px;
+  margin-bottom: 4px;
+}
+
+.sheets-tab {
+  width: 100%;
+  text-align: left;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+  margin-bottom: 2px;
+}
+
+.sheets-tab:hover {
+  background: var(--bg-hover);
+}
+
+.sheets-tab.active {
+  background: var(--bg-active);
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.sheets-add-btn {
+  width: 100%;
+  text-align: left;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  color: var(--text-tertiary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.sheets-add-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* ── Main Area ── */
+.sheets-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-primary);
+}
+
+.sheets-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-secondary);
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.sheets-toolbar-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.sheets-toolbar-meta {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  margin-left: 8px;
+}
+
+.sheets-toolbar-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.sheets-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+  white-space: nowrap;
+}
+
+.sheets-btn-primary {
+  background: var(--accent-primary);
+  color: var(--text-on-accent);
+}
+
+.sheets-btn-primary:hover {
+  background: var(--accent-primary-hover);
+}
+
+.sheets-btn-secondary {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+}
+
+.sheets-btn-secondary:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.sheets-btn-danger {
+  background: var(--status-error-bg);
+  color: var(--status-error);
+}
+
+.sheets-btn-danger:hover {
+  background: var(--status-error);
+  color: var(--text-on-accent);
+}
+
+/* ── Data Grid ── */
+.sheets-grid-wrapper {
+  flex: 1;
+  overflow: auto;
+  position: relative;
+}
+
+.sheets-grid {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  table-layout: auto;
+}
+
+.sheets-grid thead {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.sheets-grid th {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 10px 14px;
+  text-align: left;
+  border-bottom: 2px solid var(--border-default);
+  white-space: nowrap;
+  user-select: none;
+  min-width: 120px;
+}
+
+.sheets-grid th.col-actions {
+  width: 48px;
+  min-width: 48px;
+  text-align: center;
+}
+
+.sheets-grid th.col-row-num {
+  width: 48px;
+  min-width: 48px;
+  text-align: center;
+  color: var(--text-tertiary);
+}
+
+.sheets-grid td {
+  padding: 0;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  vertical-align: top;
+}
+
+.sheets-grid tr:hover td {
+  background: var(--bg-hover);
+}
+
+.sheets-grid tr.sheets-row-adding td {
+  background: var(--accent-primary-bg);
+}
+
+/* Cell */
+.sheets-cell {
+  padding: 8px 14px;
+  min-height: 36px;
+  cursor: text;
+  word-break: break-word;
+  transition: background var(--transition-fast);
+  line-height: 1.4;
+}
+
+.sheets-cell:hover {
+  background: var(--bg-active);
+}
+
+.sheets-cell.editing {
+  padding: 4px 6px;
+  background: var(--surface-input);
+}
+
+.sheets-cell-input {
+  width: 100%;
+  background: var(--surface-input);
+  border: 2px solid var(--accent-primary);
+  border-radius: var(--radius-sm);
+  padding: 4px 8px;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: var(--font-sans);
+  line-height: 1.4;
+  outline: none;
+  resize: vertical;
+  min-height: 28px;
+}
+
+.sheets-cell-input:focus {
+  box-shadow: 0 0 0 2px var(--accent-primary-bg);
+}
+
+/* Row number column */
+.sheets-row-num {
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  padding: 8px 6px;
+  user-select: none;
+}
+
+/* Row actions */
+.sheets-row-actions {
+  text-align: center;
+  padding: 6px;
+}
+
+.sheets-row-delete-btn {
+  color: var(--text-tertiary);
+  font-size: 16px;
+  padding: 4px;
+  border-radius: var(--radius-sm);
+  opacity: 0;
+  transition: opacity var(--transition-fast), color var(--transition-fast);
+}
+
+.sheets-grid tr:hover .sheets-row-delete-btn {
+  opacity: 1;
+}
+
+.sheets-row-delete-btn:hover {
+  color: var(--status-error);
+  background: var(--status-error-bg);
+}
+
+/* Add row */
+.sheets-add-row {
+  padding: 12px 20px;
+  border-top: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* Pagination */
+.sheets-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 20px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 12px;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  background: var(--bg-secondary);
+}
+
+.sheets-pagination-controls {
+  display: flex;
+  gap: 6px;
+}
+
+.sheets-page-btn {
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.sheets-page-btn:hover {
+  background: var(--bg-hover);
+}
+
+.sheets-page-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ── Empty State ── */
+.sheets-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  padding: 40px;
+}
+
+/* ── Modal Forms ── */
+.sheets-form-group {
+  margin-bottom: 16px;
+}
+
+.sheets-form-group label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.sheets-form-input {
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--surface-input);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-size: 14px;
+  transition: border-color var(--transition-fast);
+}
+
+.sheets-form-input:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 2px var(--accent-primary-bg);
+}
+
+.sheets-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+/* Columns builder in create sheet modal */
+.sheets-columns-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.sheets-column-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.sheets-column-row .sheets-form-input {
+  flex: 1;
+}
+
+.sheets-column-row select {
+  width: 100px;
+  padding: 8px;
+  background: var(--surface-input);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.sheets-column-remove {
+  color: var(--text-tertiary);
+  font-size: 18px;
+  padding: 4px;
+  cursor: pointer;
+}
+
+.sheets-column-remove:hover {
+  color: var(--status-error);
+}
+
+/* ── Loading overlay ── */
+.sheets-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  flex: 1;
+}
+
+/* ── Responsive ── */
+@media (max-width: 768px) {
+  .sheets-view {
+    flex-direction: column;
+  }
+
+  .sheets-sidebar {
+    width: 100%;
+    min-width: 100%;
+    max-height: 200px;
+    border-right: none;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sheets-toolbar {
+    flex-wrap: wrap;
+    padding: 10px 12px;
+  }
+
+  .sheets-grid th,
+  .sheets-cell {
+    padding: 6px 10px;
+    font-size: 12px;
+  }
+}

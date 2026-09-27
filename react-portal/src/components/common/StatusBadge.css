@@ -1,0 +1,23 @@
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.status-online .status-dot { background: var(--status-success); animation: pulseGlow 2s ease-in-out infinite; }
+.status-offline .status-dot { background: var(--text-tertiary); }
+.status-busy .status-dot { background: var(--status-warning); box-shadow: 0 0 6px var(--status-warning); }
+.status-idle .status-dot { background: var(--text-tertiary); }
+
+.status-label {
+  color: var(--text-secondary);
+}

@@ -1,0 +1,186 @@
+/*
+ * yourAICIV design tokens
+ *
+ * Brand palette
+ *   Ember  #F08A3E (dark) / #C2410C (light)  primary accent: actions, focus, brand mark
+ *   Pine   #3CC7B0 (dark) / #0F766E (light)  secondary accent: "your AI is working" signals
+ *   Ink    #0E1014                            dark surfaces
+ *   Paper  #F7F5F2                            light surfaces (warm, not clinical)
+ *
+ * Contrast (WCAG): body text >= 12:1 both themes; accent-as-text >= 4.5:1
+ * (Ember on Ink 7.6:1, #C2410C on white 5.2:1); text-on-accent >= 4.5:1.
+ *
+ * Theme selection: [data-theme] on <html>. With no stored choice the app
+ * follows the OS (prefers-color-scheme); see index.html + settingsStore.
+ */
+
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Background */
+  --bg-primary: #0e1014;
+  --bg-secondary: #14171c;
+  --bg-tertiary: #1b1f26;
+  --bg-elevated: #20252d;
+  --bg-hover: #262b34;
+  --bg-active: #2e343e;
+
+  /* Surface */
+  --surface-card: #161a20;
+  --surface-modal: #1b1f26;
+  --surface-input: #111419;
+
+  /* Text */
+  --text-primary: #eef0f3;
+  --text-secondary: #a9b0bb;
+  --text-tertiary: #7a8391;
+  --text-inverse: #0e1014;
+  --text-on-accent: #1b0f06;
+
+  /* Border */
+  --border-subtle: #232830;
+  --border-default: #2f3540;
+  --border-strong: #3e4552;
+
+  /* Accent: Ember (primary) + Pine (secondary) */
+  --accent-primary: #f08a3e;
+  --accent-primary-hover: #f59e5b;
+  --accent-primary-bg: rgba(240, 138, 62, 0.14);
+  --accent-secondary: #3cc7b0;
+  --accent-secondary-bg: rgba(60, 199, 176, 0.14);
+
+  /* Status */
+  --status-success: #34c38f;
+  --status-success-bg: rgba(52, 195, 143, 0.14);
+  --status-warning: #f5c542;
+  --status-warning-bg: rgba(245, 197, 66, 0.14);
+  --status-error: #f2706b;
+  --status-error-bg: rgba(242, 112, 107, 0.14);
+  --status-info: #6aa8f7;
+  --status-info-bg: rgba(106, 168, 247, 0.14);
+
+  /* Chat */
+  --chat-user-bg: #3a2416;
+  --chat-user-text: #fbe3d2;
+  --chat-assistant-bg: #1b1f26;
+  --chat-assistant-text: #eef0f3;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.5);
+
+  /* Radius */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --radius-full: 9999px;
+
+  /* Layout */
+  --sidebar-width: 248px;
+  --header-height: 60px;
+  --mobile-nav-height: 64px;
+
+  /* Transitions */
+  --transition-fast: 150ms ease;
+  --transition-normal: 250ms ease;
+
+  /* Fonts */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: 'Sora', 'Inter', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  /* Gradients */
+  --gradient-brand: linear-gradient(135deg, #f59e4b 0%, #c2410c 100%);
+  --gradient-brand-wide: linear-gradient(90deg, #f59e4b, #c2410c, #f59e4b);
+  --gradient-hero: radial-gradient(1200px 600px at 15% -10%, rgba(240, 138, 62, 0.16), transparent 60%),
+    radial-gradient(900px 500px at 110% 110%, rgba(60, 199, 176, 0.10), transparent 60%),
+    #0e1014;
+
+  /* Glows */
+  --glow-accent: 0 0 0 3px rgba(240, 138, 62, 0.28);
+  --glow-success: 0 0 12px rgba(52, 195, 143, 0.4);
+  --glow-cyan: 0 0 12px rgba(60, 199, 176, 0.3);
+
+  /* Terminal (operator view) */
+  --terminal-bg: #0d1117;
+  --terminal-header-bg: #161b22;
+  --terminal-text: #39d353;
+  --terminal-text-secondary: #c9d1d9;
+  --terminal-border: #30363d;
+  --terminal-connected: #3fb950;
+  --terminal-disconnected: #f85149;
+
+  /* Scrollbar */
+  --scrollbar-bg: transparent;
+  --scrollbar-thumb: #2f3540;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  --bg-primary: #f7f5f2;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #efece7;
+  --bg-elevated: #ffffff;
+  --bg-hover: #eae6e0;
+  --bg-active: #e0dbd3;
+
+  --surface-card: #ffffff;
+  --surface-modal: #ffffff;
+  --surface-input: #fbfaf8;
+
+  --text-primary: #1a1d23;
+  --text-secondary: #525a66;
+  --text-tertiary: #6b7280;
+  --text-inverse: #ffffff;
+  --text-on-accent: #ffffff;
+
+  --border-subtle: #e7e2da;
+  --border-default: #d9d3ca;
+  --border-strong: #b9b2a7;
+
+  --accent-primary: #c2410c;
+  --accent-primary-hover: #9a3412;
+  --accent-primary-bg: rgba(194, 65, 12, 0.08);
+  --accent-secondary: #0f766e;
+  --accent-secondary-bg: rgba(15, 118, 110, 0.08);
+
+  --status-success: #15803d;
+  --status-success-bg: rgba(21, 128, 61, 0.08);
+  --status-warning: #b45309;
+  --status-warning-bg: rgba(180, 83, 9, 0.08);
+  --status-error: #b91c1c;
+  --status-error-bg: rgba(185, 28, 28, 0.08);
+  --status-info: #1d4ed8;
+  --status-info-bg: rgba(29, 78, 216, 0.08);
+
+  --chat-user-bg: #fce9dc;
+  --chat-user-text: #3b1705;
+  --chat-assistant-bg: #ffffff;
+  --chat-assistant-text: #1a1d23;
+
+  --shadow-sm: 0 1px 3px rgba(26, 29, 35, 0.08);
+  --shadow-md: 0 4px 14px rgba(26, 29, 35, 0.08);
+  --shadow-lg: 0 12px 32px rgba(26, 29, 35, 0.12);
+
+  --gradient-hero: radial-gradient(1200px 600px at 15% -10%, rgba(194, 65, 12, 0.10), transparent 60%),
+    radial-gradient(900px 500px at 110% 110%, rgba(15, 118, 110, 0.08), transparent 60%),
+    #f7f5f2;
+
+  --glow-accent: 0 0 0 3px rgba(194, 65, 12, 0.22);
+
+  /* Terminal stays dark in light theme */
+  --terminal-bg: #0d1117;
+  --terminal-header-bg: #161b22;
+  --terminal-text: #39d353;
+  --terminal-text-secondary: #c9d1d9;
+  --terminal-border: #30363d;
+  --terminal-connected: #3fb950;
+  --terminal-disconnected: #f85149;
+
+  --scrollbar-bg: transparent;
+  --scrollbar-thumb: #d9d3ca;
+}

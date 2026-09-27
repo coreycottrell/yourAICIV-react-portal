@@ -1,0 +1,23 @@
+.msg-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+.msg-list-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+@media (max-width: 768px) {
+  .msg-list {
+    padding: 12px 8px;
+  }
+
+  .msg-bubble {
+    max-width: 95%;
+  }
+}
