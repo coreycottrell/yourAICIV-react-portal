@@ -215,6 +215,13 @@ Everything is optional. Integrations that aren't configured show as "not
 configured" in the app instead of failing. Values can be set in the
 environment or in `~/.env` (`KEY=value` lines).
 
+`PORTAL_PUBLIC_URL` and `TRIAL_CONFIG_PATH` survive every restart path: when
+the process env does not have one (for example the watchdog restarted the
+portal through `start.sh`), both `start.sh` and the server take it from
+`~/.env`, then `$CIV_ROOT/.env`. A value in the process env always wins. The
+file is parsed, never executed (`#` comments, `export `, and quoted values are
+fine). See `env_file.py`.
+
 | Variable | Purpose |
 |----------|---------|
 | `PORT` | Server port (default `8097`) |

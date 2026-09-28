@@ -37,6 +37,20 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+# Ensure HOME is set correctly for the aiciv user.
+# docker exec -u aiciv inherits the caller's HOME (often /root) rather than /home/aiciv.
+# Fix it here so Path.home() returns the right path throughout the server.
+if os.environ.get("HOME", "/root") == "/root" and os.path.isdir("/home/aiciv"):
+    os.environ["HOME"] = "/home/aiciv"
+
+# Keep the birth settings across every restart path: a key missing from the
+# process env (e.g. the watchdog restarted us through start.sh) is taken from
+# ~/.env or $CIV_ROOT/.env. The process env still wins. Runs before trial_gate
+# is imported so it sees TRIAL_CONFIG_PATH. See env_file.py.
+from env_file import load_env_defaults  # noqa: E402
+
+_ENV_FILE_LOADED = load_env_defaults()
+
 from site_proxy import ClientSiteMiddleware, registry_path as client_sites_registry
 from trial_gate import (
     TrialGateMiddleware,
@@ -45,12 +59,6 @@ from trial_gate import (
     is_expired_trial,
     trial_state,
 )
-
-# Ensure HOME is set correctly for the aiciv user.
-# docker exec -u aiciv inherits the caller's HOME (often /root) rather than /home/aiciv.
-# Fix it here so Path.home() returns the right path throughout the server.
-if os.environ.get("HOME", "/root") == "/root" and os.path.isdir("/home/aiciv"):
-    os.environ["HOME"] = "/home/aiciv"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -4937,4 +4945,6 @@ if __name__ == "__main__":
     print(f"[portal] Starting yourAICIV portal on port {port}")
     print(f"[portal] Bearer token: stored in {TOKEN_FILE}")
     print(f"[portal] Client sites: /site/<slug>/ from {client_sites_registry()}")
+    if _ENV_FILE_LOADED:
+        print(f"[portal] From .env (not in process env): {', '.join(sorted(_ENV_FILE_LOADED))}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

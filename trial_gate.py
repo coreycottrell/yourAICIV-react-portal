@@ -36,6 +36,12 @@ Where the record lives (ONE canonical source):
     ($CIV_ROOT defaults to $HOME). The AiCIV can write that file, so a startup
     warning says so; production trials must set TRIAL_CONFIG_PATH.
 
+    TRIAL_CONFIG_PATH is read from the process env, or, when the process env
+    does not have it, from ~/.env / $CIV_ROOT/.env at import (env_file.py).
+    The birth writes it to both, so a restart that drops the process env (the
+    watchdog restarting the portal through start.sh) keeps the operator copy
+    instead of silently falling back to the civ-writable file.
+
 Failure policy: fail CLOSED when there is any sign this is a trial.
     * The record exists but is unreadable, not valid JSON, not an object, has a
       "trial" value other than true/false, or is a trial with no usable dates
@@ -59,6 +65,13 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
+
+from env_file import load_env_defaults
+
+# Startup: a TRIAL_CONFIG_PATH missing from the process env comes from the
+# civ's .env files (the process env wins). portal_server does this too, before
+# importing this module; repeating it keeps this module right on its own.
+load_env_defaults(("TRIAL_CONFIG_PATH",))
 
 DEFAULT_DURATION_DAYS = 7
 # Public Stripe payment link from the shared contract. Overridable per install.
