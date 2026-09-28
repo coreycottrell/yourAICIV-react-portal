@@ -1515,6 +1515,20 @@ async def ws_terminal(websocket: WebSocket) -> None:
         pass
 
 
+def _launch_model_flag() -> str:
+    """The same model the AiCIV's own launchers use: $CIV_ROOT/config/launch_model.txt (the M3 trial pins
+    MiniMax-M3 there). No pin -> no --model flag, so the civ's .claude/settings.json decides. Never a
+    hardcoded model name: a fixed name here broke the trial's M3-only check (Witness ticket 3350)."""
+    root = Path(os.environ.get("CIV_ROOT") or Path.home())
+    try:
+        model = (root / "config" / "launch_model.txt").read_text().strip()
+    except OSError:
+        return ""
+    if model and re.fullmatch(r"[A-Za-z0-9._\-\[\]]{1,80}", model):
+        return f" --model {model}"
+    return ""
+
+
 async def api_context(request: Request) -> JSONResponse:
     """Return real context window usage from the latest Claude session JSONL."""
     if not check_auth(request):
@@ -1608,7 +1622,7 @@ async def api_resume(request: Request) -> JSONResponse:
         marker = Path.home() / ".current_session"
         marker.write_text(tmux_session)
         claude_cmd = (
-            f"claude --model claude-sonnet-4-6 --dangerously-skip-permissions "
+            f"claude{_launch_model_flag()} --dangerously-skip-permissions "
             f"--resume {session_id}"
         )
         # Popen is fire-and-forget so we use run_in_executor to avoid blocking
