@@ -2480,30 +2480,39 @@ def _signin_facts_sync():
 # (pid + start time identify the same process across a portal restart).
 _newborn_own: dict = {}
 _NEWBORN_OWN_FILE = Path.home() / ".portal-signin-own.json"
+_newborn_own_lock = threading.RLock()     # the record is changed from executor threads
 
 
 def _newborn_own_save() -> None:
-    try:
-        _NEWBORN_OWN_FILE.write_text(json.dumps({str(k): v for k, v in _newborn_own.items()}))
-    except OSError:
-        pass
+    with _newborn_own_lock:
+        data = json.dumps({str(k): v for k, v in dict(_newborn_own).items()})
+        tmp = _NEWBORN_OWN_FILE.with_name(_NEWBORN_OWN_FILE.name + ".tmp")
+        try:
+            tmp.write_text(data)
+            os.replace(tmp, _NEWBORN_OWN_FILE)       # atomic: a reader never sees half a file
+        except OSError:
+            pass
 
 
 def _newborn_own_load() -> None:
-    try:
-        data = json.loads(_NEWBORN_OWN_FILE.read_text())
-        for k, v in data.items():
-            _newborn_own.setdefault(int(k), int(v))
-    except (OSError, ValueError, TypeError, AttributeError):
-        pass
+    with _newborn_own_lock:
+        try:
+            data = json.loads(_NEWBORN_OWN_FILE.read_text())
+            for k, v in data.items():
+                _newborn_own.setdefault(int(k), int(v))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
 
 
 def _newborn_own_clear() -> None:
-    _newborn_own.clear()
-    try:
-        _NEWBORN_OWN_FILE.unlink()
-    except OSError:
-        pass
+    with _newborn_own_lock:
+        _newborn_own.clear()
+        try:
+            _NEWBORN_OWN_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            _newborn_own_save()                      # could not delete: leave it empty
 
 
 def _proc_stat_fields(pid: int):
@@ -2533,17 +2542,18 @@ def _boot_ticks_now():
 
 def _newborn_own_pids_sync() -> set:
     """Live processes launched by this portal's own first sign-in (and their children)."""
-    _newborn_own_load()
-    own, dropped = set(), False
-    for pid, start in list(_newborn_own.items()):
-        if _proc_start_ticks(pid) != start:
-            _newborn_own.pop(pid, None)          # exited (or the pid was reused)
-            dropped = True
-            continue
-        own |= _descendants_sync(pid)
-    if dropped:
-        _newborn_own_save()
-    return own
+    with _newborn_own_lock:
+        _newborn_own_load()
+        own, dropped = set(), False
+        for pid, start in list(_newborn_own.items()):
+            if _proc_start_ticks(pid) != start:
+                _newborn_own.pop(pid, None)          # exited (or the pid was reused)
+                dropped = True
+                continue
+            own |= _descendants_sync(pid)
+        if dropped:
+            _newborn_own_save()
+        return own
 
 
 def _adopt_children_sync(shell: int, tail: str, since: float) -> list:
@@ -2563,7 +2573,8 @@ def _adopt_children_sync(shell: int, tail: str, since: float) -> list:
         argv = _proc_argv(pid)
         if (argv and _argv_is_claude(argv) and argv[-1] == tail and pid not in _newborn_own
                 and pid != shell and _is_under(pid, shell)):
-            _newborn_own[pid] = int(f[19])
+            with _newborn_own_lock:
+                _newborn_own[pid] = int(f[19])
             found.append(pid)
     if found:
         _newborn_own_save()
@@ -3286,8 +3297,9 @@ async def api_evolution_first_boot(request: Request) -> JSONResponse:
     except Exception as e:
         return JSONResponse({"error": f"could not write marker: {e}"}, status_code=500)
     guard = _newborn_flow_guard.set("first_boot")
+    progress = {"killed": False}
     try:
-        return await _first_boot_transition()
+        return await _first_boot_transition(progress)
     except _SigninGuardStop as e:
         # Remove our own marker so a later call can re-check (it refuses
         # again while an AI runs); a stopped first boot is not a fired one.
@@ -3299,11 +3311,14 @@ async def api_evolution_first_boot(request: Request) -> JSONResponse:
         return JSONResponse({"status": "stopped_ai_running"})
     finally:
         _newborn_flow_guard.reset(guard)
-        # Whatever first boot launched is now a working AI, never "our own".
-        _newborn_own_clear()
+        # Once first boot has stopped the sign-in Claude, whatever it launches
+        # is a working AI, never "our own". A first boot stopped before that
+        # keeps the record, so a later call can still recognise the sign-in.
+        if progress["killed"]:
+            _newborn_own_clear()
 
 
-async def _first_boot_transition() -> JSONResponse:
+async def _first_boot_transition(progress: dict) -> JSONResponse:
     """main's first-boot steps, run under the t3383 per-key/per-kill guard."""
     pane = await _find_primary_pane_async()
     project_dir = str(Path.home())
@@ -3311,6 +3326,7 @@ async def _first_boot_transition() -> JSONResponse:
     # Step 1: Double Ctrl-C to kill the /login Claude instance in the same pane
     _save_portal_message("Auth complete — transitioning to evolution (same pane)...", role="assistant")
     await _kill_claude_process(pane)
+    progress["killed"] = True
 
     # Step 2: Wait for Claude to exit (up to 10s)
     exited = False

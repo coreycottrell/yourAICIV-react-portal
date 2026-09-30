@@ -703,3 +703,45 @@ def test_one_failed_pane_lookup_is_not_an_exit(portal, monkeypatch):
     monkeypatch.setattr(mod, "_signin_helper_pane", flaky)
     r = asyncio.run(mod._signin_helper_submit_code("c#s"))
     assert r["result"] == "pending" and n["closed"] is None
+
+
+
+def test_first_boot_stopped_before_its_kill_keeps_the_sign_in_record(portal, monkeypatch):
+    """Delta review #1: a stop at the kill check keeps the record, so a retry can
+    still recognise the sign-in Claude."""
+    mod, home, calls = portal
+    did = []
+    _fb_fakes(mod, monkeypatch, did)
+    me = os.getpid()                                   # a live process stands in for the sign-in Claude
+    mod._newborn_own[me] = mod._proc_start_ticks(me)
+    mod._newborn_own_save()
+    state = {"n": 0}
+
+    def procs():
+        state["n"] += 1
+        return [] if state["n"] == 1 else [777]      # a foreign AI appears before the kill
+    monkeypatch.setattr(mod, "_claude_processes_sync", procs)
+    monkeypatch.setattr(mod, "_proc_argv", lambda pid: ["claude"])
+    r = TestClient(mod.app).post("/api/evolution/first-boot", headers=H).json()
+    assert r == {"status": "stopped_ai_running"} and did == []
+    assert me in mod._newborn_own and mod._NEWBORN_OWN_FILE.exists()
+    assert not mod.FIRST_BOOT_MARKER.exists()
+
+
+def test_own_record_save_is_atomic_and_clear_survives_unlink_failure(portal, monkeypatch):
+    mod, home, calls = portal
+    mod._newborn_own[1] = 2
+    mod._newborn_own_save()
+    assert json.loads(mod._NEWBORN_OWN_FILE.read_text()) == {"1": 2}
+    assert not mod._NEWBORN_OWN_FILE.with_name(mod._NEWBORN_OWN_FILE.name + ".tmp").exists()
+    real_unlink = type(mod._NEWBORN_OWN_FILE).unlink
+
+    def bad_unlink(self, *a, **k):
+        if self == mod._NEWBORN_OWN_FILE:
+            raise PermissionError("read-only")
+        return real_unlink(self, *a, **k)
+    monkeypatch.setattr(type(mod._NEWBORN_OWN_FILE), "unlink", bad_unlink)
+    mod._newborn_own_clear()
+    assert json.loads(mod._NEWBORN_OWN_FILE.read_text()) == {}
+    mod._newborn_own_load()
+    assert mod._newborn_own == {}
