@@ -5,7 +5,7 @@ export interface EvolutionStatusResponse {
 }
 
 export interface EvolutionFireResponse {
-  status: 'fired' | 'already_evolved' | 'already_fired'
+  status: 'fired' | 'already_evolved' | 'already_fired' | 'already_active'
   message?: string
   error?: string
 }

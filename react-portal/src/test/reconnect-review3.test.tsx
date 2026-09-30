@@ -6,10 +6,13 @@ import { render, screen, fireEvent, act } from '@testing-library/react'
  * Each test fails on 8b6c2b0 and passes after the fix.
  *   3  Start and Close carry the same attempt id (a Close that reaches the
  *      server first still cancels its Start)
- *   4  the Reconnect button never fires the first-boot awakening, even when
- *      Claude is signed out (an established AI whose sign-in expired); it
- *      tidies Claude's "Press Enter" screen instead
+ *   4  a sign-in on a signed-out AI leaves the newborn decision to the server
+ *      (first-boot answers 'already_active' for an established AI) and tidies
+ *      Claude's "Press Enter" screen when the awakening does not run
  *   4b a first sign-in whose awakening does not run tidies the pane too
+ *   8  a Start that returns "pending" is followed by polling; a flow that ends
+ *      without a link goes back to Start; a failed Start request closes the
+ *      server flow (same attempt id)
  */
 
 type Deferred<T> = { promise: Promise<T>; resolve: (v: T) => void }
@@ -102,8 +105,9 @@ describe('review round 3', () => {
     await act(async () => { late.resolve({ started: false, cancelled: true }) })
   })
 
-  it('4: Reconnect on a signed-out established AI never fires first-boot and tidies the pane', async () => {
+  it('4: Reconnect on a signed-out established AI: the server declines first-boot and the pane is tidied', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
+    api.fire.mockResolvedValue({ status: 'already_active' })
     api.status = { authenticated: false, reason: 'expired_api_reports_auth_failure', expires_at: 5 }
     render(<><ReconnectClaudeButton /><ClaudeAuthFlow /></>)
     await flush()
@@ -120,8 +124,9 @@ describe('review round 3', () => {
     api.status = { authenticated: true, reason: 'token_valid', expires_at: 999 }
     api.verify = { confirmed: true, state: 'confirmed' }
     await act(async () => { await vi.advanceTimersByTimeAsync(6200) })
-    expect(api.fire).not.toHaveBeenCalled()
-    expect(api.post.mock.calls.filter(c => c[0] === '/api/auth/close').length).toBeGreaterThan(0)
+    await flush()
+    expect(api.fire).toHaveBeenCalledTimes(1)
+    expect(api.post.mock.calls.filter(c => c[0] === '/api/auth/close').length).toBe(1)
   })
 
   it('4b: a first sign-in whose awakening does not run tidies Claude\'s Press Enter screen', async () => {
@@ -141,5 +146,35 @@ describe('review round 3', () => {
     await flush()
     expect(api.fire).toHaveBeenCalledTimes(1)
     expect(api.post.mock.calls.filter(c => c[0] === '/api/auth/close').length).toBe(1)
+  })
+
+  it('8: a pending Start polls; a flow that ends without a link goes back to Start', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    api.start = async () => ({ started: true, pending: true })
+    api.get.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/status') return { ...api.status }
+      if (path === '/api/auth/url') return { url: null, ready: false, done: true, busy: true, error: 'Your AI is in the middle of a task right now.' }
+      return {}
+    })
+    await openReconnect()
+    fireEvent.click(screen.getByRole('button', { name: 'Start sign-in' }))
+    await flush()
+    await act(async () => { await vi.advanceTimersByTimeAsync(2100) })
+    await flush()
+    expect(screen.queryByText(/Waiting for authorization link/)).toBeNull()
+    expect(screen.getByRole('button', { name: 'Start sign-in' })).toBeInTheDocument()
+    expect(screen.getByText(/middle of a task/)).toBeInTheDocument()
+  })
+
+  it('8b: a Start request that fails on the way closes the server flow with its attempt id', async () => {
+    api.start = async () => { throw new Error('API error 524') }
+    await openReconnect()
+    fireEvent.click(screen.getByRole('button', { name: 'Start sign-in' }))
+    await flush()
+    await flush()
+    const start = api.post.mock.calls.find(c => c[0] === '/api/auth/start')
+    const close = api.post.mock.calls.find(c => c[0] === '/api/auth/close')
+    expect(close).toBeTruthy()
+    expect((close?.[1] as { attempt?: string }).attempt).toBe((start?.[1] as { attempt?: string }).attempt)
   })
 })

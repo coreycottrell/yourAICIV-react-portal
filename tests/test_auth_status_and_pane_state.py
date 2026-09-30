@@ -380,12 +380,15 @@ FAKE_CLAUDE = textwrap.dedent(r'''
     print("Claude Code v2.1.273  Opus 4.8 (1M context)", flush=True)
     print("✗ Auto-update failed · Try claude doctor or npm i -g @anthropic-ai/claude-code", flush=True)
     print("API Error: 401 OAuth access token has expired", flush=True)
+    # Real Claude Code 2.1.x input box: a rule, then "❯ " (placeholder when empty)
+    print("─" * 60, flush=True)
+    print('❯ Try "fix lint errors"', flush=True)
     for line in sys.stdin:
         line = line.rstrip("\n")
         log.write(repr(line) + "\n")
         if line.strip() == "/login":
             print("Select login method:", flush=True)
-            print(" > 1. Claude account with subscription", flush=True)
+            print(" ❯ 1. Claude account with subscription", flush=True)
         elif line.strip() == "":
             print("Browser didn't open? Use the url below to sign in:", flush=True)
             print("https://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=xyz123", flush=True)

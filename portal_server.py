@@ -1081,6 +1081,8 @@ async def api_chat_send(request: Request) -> JSONResponse:
         tagged = f"[portal] {message}"
 
     session = get_tmux_session()
+    if _signin_holds_pane():
+        return JSONResponse({"error": SIGNIN_HOLD_MESSAGE, "held_for_signin": True}, status_code=409)
     try:
         # Leading newline clears any partial input in buffer
         # All subprocess calls use async wrapper to avoid blocking the event loop
@@ -1285,6 +1287,8 @@ async def api_chat_upload(request: Request) -> JSONResponse:
         session = get_tmux_session()
         tmux_ok = False
         try:
+            if _signin_holds_pane():
+                raise RuntimeError("a sign-in owns the pane; upload notice not typed")
             # Leading newline clears any partial input in buffer — async to avoid blocking event loop
             await _run_subprocess_async(
                 ["tmux", "send-keys", "-t", session, "-l", f"\n{notification}"],
@@ -1691,6 +1695,8 @@ async def api_inject_pane(request: Request) -> JSONResponse:
     message = body.get("message", "").strip()
     if not pane_id or not message:
         return JSONResponse({"error": "pane_id and message required"}, status_code=400)
+    if _signin_holds_pane() and pane_id in (await _find_primary_pane_async(), get_tmux_session()):
+        return JSONResponse({"error": SIGNIN_HOLD_MESSAGE, "held_for_signin": True}, status_code=409)
     try:
         r = await _run_subprocess_async(["tmux", "send-keys", "-t", pane_id, "-l", message], check=True)
         if r is None:
@@ -1975,6 +1981,39 @@ def _foreground_claude_in_tree(root_pid: int, table: dict) -> bool:
     return False
 
 
+def _is_interactive_shell_argv(argv) -> bool:
+    """bash / -bash / sh … with options only: a shell sitting at its prompt.
+    `bash script.sh`, `bash -c '…'`, `sh -lc …` are not."""
+    if not argv:
+        return False
+    if os.path.basename(str(argv[0])).lstrip("-").lower() not in _SHELL_NAMES:
+        return False
+    for a in argv[1:]:
+        a = str(a)
+        if not a.startswith("-"):
+            return False
+        if not a.startswith("--") and "c" in a[1:]:
+            return False
+    return True
+
+
+def _foreground_pids_in_tree(root_pid: int, table: dict) -> list:
+    children = {}
+    for pid, info in table.items():
+        children.setdefault(info["ppid"], []).append(pid)
+    out, stack, seen = [], [root_pid], set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        info = table.get(pid)
+        if info and info["tpgid"] > 0 and info["pgrp"] == info["tpgid"]:
+            out.append(pid)
+        stack.extend(children.get(pid, []))
+    return out
+
+
 def _classify_pane(current_command: str, pane_pid, table: dict) -> str:
     """Classify a pane as 'claude', 'shell' or 'unknown'.
 
@@ -1991,6 +2030,16 @@ def _classify_pane(current_command: str, pane_pid, table: dict) -> str:
         root = None
     if root and _foreground_claude_in_tree(root, table):
         return "claude"
+    if root and root in table:
+        # "shell" means an INTERACTIVE shell waiting at its prompt. A bash that
+        # runs a script or `-c` (a restart loop between Claude relaunches) is
+        # NOT a prompt: text typed there reaches the next Claude it starts
+        # (review round 3, #1). Those panes are 'unknown' — nothing is typed.
+        fg = _foreground_pids_in_tree(root, table)
+        if fg:
+            if all(_is_interactive_shell_argv(table[p]["argv"]) for p in fg):
+                return "shell"
+            return "unknown"
     if "claude" in cmd or _VERSION_TITLE_RE.match(cmd):
         return "claude"
     if cmd in _SHELL_NAMES:
@@ -2047,6 +2096,8 @@ _stale_oauth_urls: set = set()
 _SESSION_BUSY_RE = re.compile(r'esc to interrupt', re.IGNORECASE)
 AUTH_BUSY_MESSAGE = ("Your AI is in the middle of a task right now. "
                      "Try again in a minute, when it has finished.")
+AUTH_INPUT_BUSY_MESSAGE = ("There is unsent text in your AI's message box. "
+                           "Send or clear it, then try again.")
 AUTH_STUCK_MESSAGE = ("Claude has another screen open that the sign-in could not close. "
                       "Wait a minute and try again.")
 
@@ -2055,25 +2106,76 @@ def _session_is_busy(visible_text: str) -> bool:
     return bool(visible_text) and bool(_SESSION_BUSY_RE.search(visible_text))
 
 
-_INPUT_PROMPT_LINE_RE = re.compile(r'^\s*[│|]?\s*>(?:\s|$)')
+# --- Where is Claude Code's INPUT prompt? --------------------------------------
+# Real Claude Code 2.1.x draws the input box as a horizontal rule followed by a
+# line starting "❯ " (read first-order from a live 2.1.280 pane, ticket 3383
+# round 3); an empty box shows a dim 'Try "…"' placeholder. Pickers use the
+# SAME "❯" as their cursor ("❯ 1. Claude account…"), so "❯" only counts as
+# the input prompt directly under a rule and never as a numbered option.
+# Older / boxed builds draw "> " or "│ > "; those still count.
+_HRULE_RE = re.compile(r'^\s*[─━]{8,}\s*$')
+_LEGACY_PROMPT_RE = re.compile(r'^\s*[│|]?\s*>(?:\s|$)')
+_CHEVRON_PROMPT_RE = re.compile(r'^\s*[│|]?\s*❯(?:\s|$)')
+_SELECTOR_OPTION_RE = re.compile(r'^\s*[│|]?\s*[❯›>]\s*(?:\d+[.)]|\[)')
+_PROMPT_TEXT_RE = re.compile(r'^\s*[│|]?\s*(?:>|❯)\s?(.*?)\s*[│|]?\s*$')
+_PLACEHOLDER_RE = re.compile(r'^Try "')
+
+
+def _screen_lines(text: str, n: int = 40) -> list:
+    return [ln for ln in (text or "").splitlines() if ln.strip()][-n:]
+
+
+def _is_input_prompt(lines: list, i: int) -> bool:
+    ln = lines[i]
+    if _SELECTOR_OPTION_RE.match(ln):
+        return False  # "❯ 1. …" / "> 1. …" is a picker option, never the input box
+    if _LEGACY_PROMPT_RE.match(ln):
+        return True
+    if _CHEVRON_PROMPT_RE.match(ln) and not _SELECTOR_OPTION_RE.match(ln):
+        return i > 0 and bool(_HRULE_RE.match(lines[i - 1]))
+    return False
+
+
+def _last_input_prompt(lines: list) -> int:
+    return max((i for i in range(len(lines)) if _is_input_prompt(lines, i)), default=-1)
+
+
+def _idle_input_prompt_problem(visible_text: str):
+    """Pure: None when the AI's input box is the ACTIVE screen and EMPTY, so
+    typing "/login" + Enter is safe. Otherwise a short reason: 'no_prompt'
+    (some other screen), 'dialog_open' (a selector/question drawn below the
+    prompt: Enter would pick its default), 'input_not_empty' (the owner's
+    unsent text would be sent together with "/login")."""
+    lines = _screen_lines(visible_text)
+    idx = _last_input_prompt(lines)
+    if idx < 0:
+        return "no_prompt"
+    for ln in lines[idx + 1:]:
+        if _SELECTOR_OPTION_RE.match(ln) or _CHEVRON_PROMPT_RE.match(ln) or re.search(r'Do you want to', ln):
+            return "dialog_open"
+    m = _PROMPT_TEXT_RE.match(lines[idx])
+    text = (m.group(1) if m else "").strip()
+    if text and not _PLACEHOLDER_RE.match(text):
+        return "input_not_empty"
+    return None
 
 
 def _blocker_is_active(visible_text: str, pattern) -> bool:
     """Pure: is a blocking dialog matching `pattern` the ACTIVE screen? Claude
     Code draws its dialogs in place of the input box, so the match must come
-    AFTER the last input-prompt line ("> "). The same words higher up are the
-    AI's own conversation and never earn a key press (review round 2, #1)."""
-    if not visible_text:
+    AFTER the last input prompt. The same words higher up are the AI's own
+    conversation and never earn a key press (review round 2, #1)."""
+    lines = _screen_lines(visible_text)
+    if not lines:
         return False
-    lines = [ln for ln in visible_text.splitlines() if ln.strip()][-40:]
-    last_prompt = max((i for i, ln in enumerate(lines) if _INPUT_PROMPT_LINE_RE.match(ln)), default=-1)
+    last_prompt = _last_input_prompt(lines)
     last_match = max((i for i, ln in enumerate(lines) if pattern.search(ln)), default=-1)
     return last_match > last_prompt
 
 
 def _active_blocker(visible_text: str):
     """Which blocking dialog (if any) is ACTIVE on the visible screen now."""
-    if _plan_mcp_dialog(visible_text) is not None:
+    if _plan_mcp_dialog(visible_text) is not None and _blocker_is_active(visible_text, _MCP_DIALOG_HEADER_RE):
         return 'mcp_server'
     for name in ('trust_folder', 'update_prompt', 'csat_survey'):
         if _blocker_is_active(visible_text, AUTH_SCREEN_PATTERNS[name]):
@@ -2096,6 +2198,31 @@ class _AuthFlow:
         self.attempt = attempt
         self.cancel = asyncio.Event()
         self.finished = asyncio.Event()
+        self.result = None
+        self.task = None
+
+
+_last_auth_flow = None  # the most recent Start flow (its outcome, for /api/auth/url)
+
+# While a sign-in owns the AI's pane (a flow is running, or the login picker /
+# code prompt is open waiting for the owner), the portal's OWN injectors (chat
+# send, upload notices, scheduled tasks, AgentCal) hold their text instead of
+# typing it into the sign-in screen (review round 3, #9).
+AUTH_SCREEN_HOLD_S = 600.0
+_auth_screen_open_until = 0.0
+
+
+def _signin_holds_pane() -> bool:
+    return _auth_flow_running() or time.time() < _auth_screen_open_until
+
+
+def _release_signin_hold() -> None:
+    global _auth_screen_open_until
+    _auth_screen_open_until = 0.0
+
+
+SIGNIN_HOLD_MESSAGE = ("Claude is signing in right now. Your message was not sent; "
+                       "send it again when the sign-in is finished.")
 
 
 async def _auth_body(request: Request) -> dict:
@@ -2145,6 +2272,15 @@ async def _auth_key(pane: str, key: str, flow=None, literal: bool = False, check
     _auth_check(flow)
     cmd = ["tmux", "send-keys", "-t", pane] + (["-l", key] if literal else [key])
     return await _run_subprocess_async(cmd, check=check)
+
+
+async def _auth_line(pane: str, text: str, flow=None):
+    """Type a line and press Enter as ONE unit: the cancel check happens once,
+    before the text, so a Close can never leave "/login" (or the launch line)
+    sitting unsent in the AI's input box (review round 3, #10)."""
+    _auth_check(flow)
+    await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "-l", text], check=True)
+    await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
 
 
 def _oauth_urls(content: str) -> list:
@@ -2320,8 +2456,9 @@ async def _dismiss_mcp_dialog(pane: str, flow=None) -> str:
     """Close the MCP startup dialog so /login can proceed. Returns an outcome:
     'enabled_this' | 'enabled_selected' | 'fallback_default' | 'fallback_escape'
     | 'not_visible' (nothing pressed: the dialog is not on the visible screen)."""
-    plan = _plan_mcp_dialog(await _capture_visible(pane))
-    if plan is None:
+    first = await _capture_visible(pane)
+    plan = _plan_mcp_dialog(first)
+    if plan is None or not _blocker_is_active(first, _MCP_DIALOG_HEADER_RE):
         return "not_visible"
     for _ in range(2):
         if plan["on_target"]:
@@ -2388,7 +2525,7 @@ async def _signal_pids(pids, sig) -> None:
             pass
 
 
-async def _kill_claude_process(pane: str, only=None, exclude=None) -> list:
+async def _kill_claude_process(pane: str, only=None, exclude=None, require_arg=None) -> list:
     """Stop the Claude process(es) running IN THIS PANE, by PID. Never pkill.
 
     Only Claude processes found in the pane's own process tree are touched
@@ -2407,6 +2544,10 @@ async def _kill_claude_process(pane: str, only=None, exclude=None) -> list:
         pids &= set(only)
     if exclude:
         pids -= set(exclude)
+    if require_arg:
+        # e.g. "/login": only the sign-in instance, never a live session that
+        # a wrapper relaunched (review round 3, #1)
+        pids = {p for p in pids if require_arg in (table.get(p) or {}).get("argv", [])[1:]}
     if not pids:
         return []
     await _signal_pids(pids, signal.SIGTERM)
@@ -2519,6 +2660,13 @@ async def _run_auth_state_machine(pane: str, flow: "_AuthFlow" = None) -> dict:
                 log(f"Open dialog before /login: {pre} ({'dismissed' if acted else 'nothing pressed'})")
                 await nap(1.0)
                 continue
+            problem = _idle_input_prompt_problem(visible)
+            if problem is not None:
+                # Another screen (a tool-permission question, a selector, the
+                # rewind menu) or the owner's unsent text: "/login" + Enter
+                # would answer it or send it. Type nothing (review round 3, #4).
+                log(f"The AI's input box is not free ({problem}) — nothing typed")
+                return stop(error=AUTH_STUCK_MESSAGE if problem != "input_not_empty" else AUTH_INPUT_BUSY_MESSAGE)
         # Snapshot what is already on screen so stale sign-in text is ignored.
         baseline = _auth_screen_baseline(await _capture_auth_screen(pane))
         _stale_oauth_urls.clear()
@@ -2528,12 +2676,10 @@ async def _run_auth_state_machine(pane: str, flow: "_AuthFlow" = None) -> dict:
             launched_pre_pids = _all_claude_pids(table)
             log("Claude not running (pane is at a shell) — launching 'claude /login'")
             launch_cmd = f"clear && cd {shlex.quote(str(Path.home()))} && claude /login"
-            await keys(launch_cmd, literal=True, check=True)
-            await keys("Enter", check=True)
+            await _auth_line(pane, launch_cmd, flow)
         elif pane_state == "claude":
             log("Claude already running — sending /login")
-            await keys("/login", literal=True, check=True)
-            await keys("Enter", check=True)
+            await _auth_line(pane, "/login", flow)
         else:
             # Fail closed: never type a shell line (or anything) into a pane we
             # cannot identify — that is how a live Claude prompt got polluted.
@@ -2562,6 +2708,8 @@ async def _run_auth_state_machine(pane: str, flow: "_AuthFlow" = None) -> dict:
                 if url:
                     _auth_check(flow)  # a cancelled flow never publishes a URL
                     _captured_oauth_url = url
+                    global _auth_screen_open_until
+                    _auth_screen_open_until = time.time() + AUTH_SCREEN_HOLD_S
                     log(f"OAuth URL captured ({len(url)} chars) in {elapsed:.1f}s")
                     return {"started": True, "url": url, "log": log_entries}
 
@@ -2623,7 +2771,7 @@ async def _run_auth_state_machine(pane: str, flow: "_AuthFlow" = None) -> dict:
                 # Only the `claude /login` this flow launched (a Claude in this
                 # pane's own process tree that did not exist before the launch).
                 _auth_check(flow)
-                killed = await _kill_claude_process(pane, exclude=launched_pre_pids)
+                killed = await _kill_claude_process(pane, exclude=launched_pre_pids, require_arg="/login")
                 if killed:
                     log(f"Stopped the sign-in Claude this portal launched (pid {', '.join(map(str, killed))}) for a clean retry")
                     await nap(1.0)
@@ -2730,13 +2878,11 @@ def _evaluate_claude_credentials(creds_path: Path, now_ms: int = None) -> dict:
     # Code refreshes it on its next model request. An idle CIV makes none, so
     # its file can show an access token hours or days old while it is fine.
     # The caller decides from evidence (an auth failure reported by the API).
-    if now_ms - expires_at > AUTH_REFRESH_MAX_IDLE_S * 1000:
-        # Not used for longer than any refresh grant is trusted to live:
-        # signed out (the owner reconnects once). Bounds the "idle is not
-        # signed out" rule so a revoked grant cannot read signed-in forever.
-        out["reason"] = "expired_refresh_too_old"
-        return out
     out["needs_live_check"] = True
+    # Unused for longer than a refresh grant is trusted to live: signed out
+    # UNLESS the transcripts prove the grant still works (decided by the
+    # caller). Bounds "idle is not signed out" (review rounds 2/3).
+    out["too_old"] = now_ms - expires_at > AUTH_REFRESH_MAX_IDLE_S * 1000
     if now_ms - expires_at > AUTH_REFRESH_GRACE_S * 1000:
         out["reason"] = "expired_beyond_refresh_grace"
     else:
@@ -2868,11 +3014,15 @@ def _scan_transcript_incremental_locked(p: Path) -> dict:
         return {"last_real_ms": None, "last_auth_fail_ms": None}
     key = str(p)
     ent = _auth_evidence_cache.get(key)
-    grow = None if ent is None else st.st_size - ent["offset"]
-    if (ent is None or ent["offset"] is None or ent["ino"] != st.st_ino
-            or grow < 0 or grow > _AUTH_EVIDENCE_TAIL_BYTES):
+    grow = None
+    if ent is not None and isinstance(ent.get("offset"), int):
+        grow = st.st_size - ent["offset"]
+    if grow is None or ent["ino"] != st.st_ino or grow < 0 or grow > _AUTH_EVIDENCE_TAIL_BYTES:
         res, offset = _scan_transcript_tail_with_offset(p)
-        _auth_evidence_cache[key] = {"ino": st.st_ino, "offset": offset, "res": dict(res)}
+        if offset is None:
+            _auth_evidence_cache.pop(key, None)  # unreadable now: rescan next time
+        else:
+            _auth_evidence_cache[key] = {"ino": st.st_ino, "offset": offset, "res": dict(res)}
         return res
     if grow == 0:
         return dict(ent["res"])
@@ -2939,6 +3089,8 @@ def _decide_auth_with_evidence(ev: dict, evidence: dict, creds_mtime_ms):
         return False, "expired_api_reports_auth_failure", False
     if real is not None and ev["expires_at"] is not None and real >= ev["expires_at"]:
         return True, "expired_refresh_proven_by_recent_turn", False
+    if ev.get("too_old"):
+        return False, "expired_refresh_too_old", False
     return True, "expired_refresh_pending", False
 
 
@@ -3038,21 +3190,24 @@ async def api_claude_auth_status(request: Request) -> JSONResponse:
                              "expires_at": None, "subscription": None})
 
 
+AUTH_START_WAIT_S = 20.0
+
+
 async def api_claude_auth_start(request: Request) -> JSONResponse:
     """Start Claude OAuth flow using v2 state machine with screen detection.
 
     Drives the full auth flow: starts Claude, detects and dismisses blocking
-    dialogs (CSAT surveys, update prompts, trust folder), selects login option,
-    and polls for OAuth URL. Returns the URL inline when possible.
-
-    This is a longer-running endpoint (up to ~60s) but returns WITH the URL
-    when the flow completes successfully. Only ONE flow runs at a time; POST
-    /api/auth/close cancels it (also when the Close arrives first: same
-    "attempt" id).
+    dialogs, selects the login option, and waits for the OAuth URL. The flow
+    runs as a background task: this request waits up to AUTH_START_WAIT_S and
+    returns the result, or {"started": true, "pending": true} — the browser
+    then polls /api/auth/url, which also reports how the flow ended. So a
+    proxy timeout on this request never orphans the flow (review round 3,
+    #8). Only ONE flow runs at a time; POST /api/auth/close cancels it (also
+    when the Close arrives first: same "attempt" id).
     """
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    global _captured_oauth_url, _auth_flow, _auth_code_submission
+    global _captured_oauth_url, _auth_flow, _auth_code_submission, _last_auth_flow
     body = await _auth_body(request)
     attempt = _attempt_id(body)
     if attempt and attempt in _closed_attempts:
@@ -3063,24 +3218,39 @@ async def api_claude_auth_start(request: Request) -> JSONResponse:
     # Register BEFORE any await so a Close can always find (and cancel) it.
     flow = _AuthFlow(None, attempt)
     _auth_flow = flow
+    _last_auth_flow = flow
     _captured_oauth_url = None
     _auth_code_submission = None
+    _release_signin_hold()
+
+    async def runner():
+        global _auth_flow
+        try:
+            _auth_check(flow)
+            pane = await _find_primary_pane_async()
+            flow.pane = pane
+            _save_portal_message(f"Auth flow v2 started — {get_tmux_session()} (pane {pane})", role="assistant")
+            flow.result = await _run_auth_state_machine(pane, flow)
+        except _AuthCancelled:
+            _save_portal_message("Auth flow v2 cancelled by the owner — stopped", role="assistant")
+            flow.result = {"started": False, "cancelled": True, "error": "sign-in cancelled"}
+        except Exception as e:
+            _save_portal_message(f"Auth flow v2 failed: {e}", role="assistant")
+            flow.result = {"started": False, "error": f"auth flow error: {e}"}
+        finally:
+            flow.finished.set()
+            if _auth_flow is flow:
+                _auth_flow = None
+
+    flow.task = asyncio.create_task(runner())
     try:
-        pane = await _find_primary_pane_async()
-        flow.pane = pane
-        _save_portal_message(f"Auth flow v2 started — {get_tmux_session()} (pane {pane})", role="assistant")
-        result = await _run_auth_state_machine(pane, flow)
-        return JSONResponse(result)
-    except _AuthCancelled:
-        _save_portal_message("Auth flow v2 cancelled by the owner — stopped", role="assistant")
-        return JSONResponse({"started": False, "cancelled": True, "error": "sign-in cancelled"})
-    except Exception as e:
-        _save_portal_message(f"Auth flow v2 failed: {e}", role="assistant")
-        return JSONResponse({"error": f"auth flow error: {e}"}, status_code=500)
-    finally:
-        flow.finished.set()
-        if _auth_flow is flow:
-            _auth_flow = None
+        await asyncio.wait_for(asyncio.shield(flow.finished.wait()), timeout=AUTH_START_WAIT_S)
+    except asyncio.TimeoutError:
+        return JSONResponse({"started": True, "pending": True})
+    result = dict(flow.result or {"started": False, "error": "auth flow ended without a result"})
+    if result.get("error") and "started" not in result:
+        result["started"] = False
+    return JSONResponse(result)
 
 
 async def api_claude_auth_prewarm(request: Request) -> JSONResponse:
@@ -3146,11 +3316,11 @@ def _pane_awaits_auth_code(visible_text: str) -> bool:
     AI's chat input and sent as a message."""
     if not visible_text:
         return False
-    lines = [ln for ln in visible_text.splitlines() if ln.strip()][-40:]
+    lines = _screen_lines(visible_text)
     last_paste = max((i for i, ln in enumerate(lines) if _AUTH_PASTE_PROMPT_RE.search(ln)), default=-1)
     if last_paste < 0:
         return False
-    last_prompt = max((i for i, ln in enumerate(lines) if _AUTH_CLOSE_PROMPT_LINE_RE.match(ln)), default=-1)
+    last_prompt = _last_input_prompt(lines)
     last_finish = max((i for i, ln in enumerate(lines) if _AUTH_CLOSE_FINISH_RE.search(ln)), default=-1)
     return last_paste > last_prompt and last_paste > last_finish
 
@@ -3247,7 +3417,6 @@ _AUTH_CLOSE_CANCEL_RE = re.compile(
 )
 
 
-_AUTH_CLOSE_PROMPT_LINE_RE = re.compile(r'^\s*[│|]?\s*>(?:\s|$)')
 
 
 def _plan_auth_close(screen_text: str):
@@ -3259,8 +3428,8 @@ def _plan_auth_close(screen_text: str):
     double Escape at the prompt opens Claude Code's rewind menu)."""
     if not screen_text:
         return None
-    lines = [ln for ln in screen_text.splitlines() if ln.strip()][-40:]
-    last_prompt = max((i for i, ln in enumerate(lines) if _AUTH_CLOSE_PROMPT_LINE_RE.match(ln)), default=-1)
+    lines = _screen_lines(screen_text)
+    last_prompt = _last_input_prompt(lines)
     last_finish = max((i for i, ln in enumerate(lines) if _AUTH_CLOSE_FINISH_RE.search(ln)), default=-1)
     last_cancel = max((i for i, ln in enumerate(lines) if _AUTH_CLOSE_CANCEL_RE.search(ln)), default=-1)
     tail_after = lambda i: "\n".join(lines[i:])
@@ -3296,6 +3465,7 @@ async def api_claude_auth_close(request: Request) -> JSONResponse:
             stopped = False
     _captured_oauth_url = None
     _auth_code_submission = None
+    _release_signin_hold()
     pane = (flow.pane if flow is not None else None) or await _find_primary_pane_async()
     try:
         if flow is not None and not flow.finished.is_set():
@@ -3328,6 +3498,19 @@ async def api_claude_auth_url(request: Request) -> JSONResponse:
     global _captured_oauth_url
     if _captured_oauth_url:
         return JSONResponse({"url": _captured_oauth_url, "ready": True})
+    last = _last_auth_flow
+    if last is not None and last.finished.is_set():
+        # The flow ended without a URL: say how, so the page never spins.
+        res = last.result or {}
+        out = {"url": None, "ready": False, "done": True}
+        for k in ("already_authenticated", "busy", "cancelled", "error"):
+            if res.get(k):
+                out[k] = res[k]
+        if res.get("url"):
+            return JSONResponse({"url": res["url"], "ready": True})
+        return JSONResponse(out)
+    if last is not None and not last.finished.is_set():
+        return JSONResponse({"url": None, "ready": False})
     pane = await _find_primary_pane_async()
     try:
         # -J joins wrapped lines so long URLs aren't truncated at terminal width
@@ -3405,6 +3588,13 @@ async def api_evolution_first_boot(request: Request) -> JSONResponse:
         return JSONResponse({"status": "already_evolved"})
     if FIRST_BOOT_MARKER.exists():
         return JSONResponse({"status": "already_fired"})
+    # An AI that has already had real conversations is not a newborn, even if
+    # both markers are missing (an interrupted or orchestrator-awakened birth).
+    # Its live session is never killed and re-awakened (review round 3, #3).
+    evidence = await asyncio.to_thread(_auth_turn_evidence)
+    if evidence.get("last_real_ms") is not None:
+        _save_portal_message("Sign-in complete — this AI is already awake, no first-boot needed", role="assistant")
+        return JSONResponse({"status": "already_active"})
     # Write marker before launching — prevents double-fire on concurrent calls
     try:
         FIRST_BOOT_MARKER.write_text(str(time.time()))
@@ -3669,6 +3859,8 @@ async def _scheduled_task_checker() -> None:
         now_iso = now.isoformat()
         fired = []
         for task in _scheduled_tasks:
+            if task.get("fire_at", "") <= now_iso and _signin_holds_pane():
+                continue  # a sign-in owns the pane: fire on the next pass
             if task.get("fire_at", "") <= now_iso:
                 # Fire this task: inject into tmux
                 session = get_tmux_session()
@@ -4054,6 +4246,8 @@ async def _agentcal_event_checker() -> None:
                         if not prompt_text or len(prompt_text) < 2:
                             _agentcal_fired_ids.add(evt_id)
                             continue
+                        if _signin_holds_pane():
+                            continue  # a sign-in owns the pane: not fired, retried next poll
                         # Fire into tmux
                         session = get_tmux_session()
                         if session:

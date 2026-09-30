@@ -1,5 +1,45 @@
 # Changelog
 
+## 2026-09-30 — Review round 4: built for the real Claude Code screen
+
+A third independent review, together with a first-order look at a live Claude
+Code 2.1.280 screen, showed two things. First, the real input box is a line
+starting "❯ " directly under a horizontal rule; an empty box shows a
+`Try "…"` placeholder. Second, pickers use the same "❯" as their cursor
+("❯ 1. …"). Every "which screen is active?" check now uses that model, so an
+old "Paste code here" or login picker left above the prompt is never treated
+as active, and a numbered option is never mistaken for the prompt.
+
+- `/login` is typed only into an EMPTY input box that is the active screen.
+  It is never typed over a tool-permission question or a selector (Enter
+  would answer it), and never over the owner's unsent text.
+- A restart-loop `bash` between Claude relaunches is not a shell prompt:
+  nothing is typed there. A retry stops only a Claude that this flow started
+  with `/login` in its arguments, never a live session a wrapper relaunched.
+- First-boot declines (`already_active`) on an AI that has already had real
+  conversations, even when both markers are missing. It never kills or
+  re-awakens such an AI. Any sign-in on a signed-out AI now asks the server,
+  which decides whether it is a newborn. A newborn whose status check failed
+  still gets its awakening.
+- Start runs the flow in the background and answers within 20 s at most
+  (`pending` + polling `/api/auth/url`, which now reports how the flow ended),
+  so a proxy timeout never orphans it. If the Start request itself fails, the
+  page closes the flow.
+- While a sign-in owns the pane (flow running, or the picker / code prompt
+  open), the portal's own injectors hold their text: chat send (409 with a
+  plain message), upload notices, scheduled tasks and AgentCal events (fired
+  on the next pass).
+- `/login` and its Enter are sent as one unit, so a Close can never leave
+  `/login` sitting in the input box.
+- The 14-day idle bound never overrides proof: a real turn after the expiry
+  still reads signed in. An unreadable-once transcript no longer disables
+  auth evidence. A quoted MCP dialog above the prompt earns no keys.
+
+Tests: 252 backend (17 new in `tests/test_review_round4_t3383.py`: 14 fail on
+78025aa, 3 positive controls) and 107 frontend (2 new plus 1 changed in
+`src/test/reconnect-review3.test.tsx`, failing on 78025aa). The test fakes
+now draw the real input box.
+
 ## 2026-09-30 — Review round 3: closing the gaps a second review found
 
 A second independent review of round 2 found the fixes incomplete in places.

@@ -15,6 +15,7 @@ interface AuthStatusResponse {
 
 interface StartResponse {
   started?: boolean
+  pending?: boolean
   url?: string
   already_authenticated?: boolean
   cancelled?: boolean
@@ -26,6 +27,12 @@ interface StartResponse {
 interface UrlResponse {
   url: string | null
   ready: boolean
+  /** The server flow ended without a URL; the flags below say how. */
+  done?: boolean
+  already_authenticated?: boolean
+  busy?: boolean
+  cancelled?: boolean
+  error?: string
 }
 
 interface CodeResponse {
@@ -86,10 +93,6 @@ export function ClaudeAuthFlow() {
   const statusPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const reconnectRef = useRef(false)
-  // Opened by the owner (Reconnect button), never by a signed-out page load:
-  // such a flow never fires the first-boot awakening, even if Claude happens
-  // to be signed out (an established AI whose sign-in expired).
-  const ownerOpenedRef = useRef(false)
   // Bumped whenever the flow is opened, closed or restarted.
   const flowRef = useRef(0)
   // Sent with Start and Close so the server can cancel a Start that arrives
@@ -156,7 +159,6 @@ export function ClaudeAuthFlow() {
       setError(null)
       setAuthUrl(null)
       setCode('')
-      ownerOpenedRef.current = true
       reconnectRef.current = true
       setReconnectMode(true)
       setAuthenticated(false)
@@ -182,7 +184,6 @@ export function ClaudeAuthFlow() {
     // continue" screen (after success).
     apiPost('/api/auth/close', attemptRef.current ? { attempt: attemptRef.current } : undefined).catch(() => {})
     reconnectRef.current = false
-    ownerOpenedRef.current = false
     setReconnectMode(false)
     setError(null)
     setAuthUrl(null)
@@ -203,18 +204,20 @@ export function ClaudeAuthFlow() {
   const finishSignedIn = useCallback((text: string) => {
     clearPolls()
     window.dispatchEvent(new CustomEvent(AUTH_CHANGED_EVENT))
-    if (reconnectRef.current || ownerOpenedRef.current) {
-      // Reconnect is not a birth: never re-run the awakening. closeFlow
-      // presses Enter on Claude's "Login successful … Press Enter" screen.
+    if (reconnectRef.current) {
+      // Signed in when the flow opened: a reconnect, not a birth. Never
+      // re-run the awakening. closeFlow presses Enter on Claude's "Login
+      // successful … Press Enter" screen.
       setSuccessText(text)
       setStep('success')
       closeTimerRef.current = setTimeout(closeFlow, 2500)
       return
     }
-    // Auth confirmed — fire evolution and dismiss immediately.
+    // Signed out when the flow opened: ask for the first-boot awakening.
+    // The SERVER decides whether this AI is a newborn (markers + whether it
+    // has ever had a real conversation) and does nothing otherwise.
     // Do NOT wait for evolution to complete (takes 10+ min).
-    // Human watches evolution in terminal/chat. If the awakening does not
-    // run (this AI already evolved), tidy Claude's "Press Enter" screen.
+    // If the awakening does not run, tidy Claude's "Press Enter" screen.
     fireFirstBoot()
       .then(r => {
         if (r && r.status !== 'fired') apiPost('/api/auth/close').catch(() => {})
@@ -250,6 +253,7 @@ export function ClaudeAuthFlow() {
         setStep('url-ready')
         return
       }
+      // res.pending: the server is still working on it; poll for the link.
       setStep('polling-url')
       const startedAt = Date.now()
       urlPollRef.current = setInterval(async () => {
@@ -261,6 +265,14 @@ export function ClaudeAuthFlow() {
         try {
           const urlRes = await apiGet<UrlResponse>('/api/auth/url')
           if (flow !== flowRef.current) return
+          if (urlRes.done && !urlRes.url) {
+            if (urlRes.already_authenticated) {
+              finishSignedIn('Claude is already signed in.')
+            } else {
+              restartWith(urlRes.cancelled ? null : (urlRes.error || 'The sign-in could not start. Try again.'))
+            }
+            return
+          }
           if (urlRes.ready && urlRes.url) {
             if (urlPollRef.current) {
               clearInterval(urlPollRef.current)
@@ -275,6 +287,9 @@ export function ClaudeAuthFlow() {
       }, 2000)
     } catch (err) {
       if (flow !== flowRef.current) return
+      // The request failed on the way (proxy timeout, network): the server
+      // flow may still be running. Stop it before offering a new start.
+      apiPost('/api/auth/close', { attempt }).catch(() => {})
       restartWith(err instanceof Error ? err.message : 'Failed to start authentication')
     }
   }, [clearPolls, finishSignedIn, restartWith])

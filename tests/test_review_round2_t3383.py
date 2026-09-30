@@ -355,7 +355,8 @@ def test_d_retry_stops_only_the_login_claude_it_launched_and_the_live_one_surviv
     (bindir / "tmux").chmod(0o755)
     (tmp_path / "stuck.py").write_text(STUCK_LOGIN)
     (tmp_path / "live.py").write_text(LIVE_CIV)
-    (bindir / "claude").write_text(f'#!/bin/bash\nexec -a claude {sys.executable} {tmp_path / "stuck.py"}\n')
+    # like the real binary, the fake keeps its arguments ("/login") in argv
+    (bindir / "claude").write_text(f'#!/bin/bash\nexec -a claude {sys.executable} {tmp_path / "stuck.py"} "$@"\n')
     (bindir / "claude").chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
     monkeypatch.setattr(ps, "AUTH_CLAUDE_START_TIMEOUT_S", 4.0)
