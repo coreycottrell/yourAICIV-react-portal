@@ -634,3 +634,72 @@ def test_submit_fails_only_after_a_bounded_wait(portal, monkeypatch):
     n = _submit_fakes(mod, monkeypatch, ["Paste code"])                        # still exchanging
     r = asyncio.run(mod._signin_helper_submit_code("c#s"))
     assert r["result"] == "pending" and n["closed"] is None
+
+
+# ------------------------------------------------ final review of round 3 (t3383)
+
+def test_own_record_survives_a_portal_restart(portal):
+    mod, home, calls = portal
+    py = 'exec -a claude python3 -c "import time; time.sleep(30)"'
+    shell = subprocess.Popen(["bash", "-c", f"({py} /login) & wait"])
+    try:
+        time.sleep(0.5)
+        kids = mod._adopt_children_sync(shell.pid, "/login", mod._boot_ticks_now() - 1000)
+        assert len(kids) == 1 and mod._NEWBORN_OWN_FILE.exists()
+        sys.modules.pop("portal_server", None)          # "restart" the portal
+        mod2 = importlib.import_module("portal_server")
+        assert mod2._newborn_own == {}
+        assert kids[0] in mod2._newborn_own_pids_sync()
+        mod2._newborn_own_clear()
+        assert not mod2._NEWBORN_OWN_FILE.exists() and mod2._newborn_own_pids_sync() == set()
+    finally:
+        for pid in sorted(mod._descendants_sync(shell.pid), reverse=True):
+            try:
+                _REAL_KILL(pid, 9)
+            except ProcessLookupError:
+                pass
+        shell.wait()
+
+
+def test_no_adoption_when_boot_time_cannot_be_read(portal, monkeypatch):
+    mod, home, calls = portal
+    monkeypatch.setattr(mod, "_boot_ticks_now", lambda: None)
+    seen = []
+
+    async def out(cmd, timeout=5):
+        seen.append(cmd)
+        return "123"
+    monkeypatch.setattr(mod, "_run_subprocess_output", out)
+    asyncio.run(mod._adopt_newborn_launch("%1", "/login"))
+    assert seen == [] and mod._newborn_own == {}
+
+
+def test_first_boot_leaves_nothing_exempt_afterwards(portal, monkeypatch):
+    """Final review #3: after first boot (fired or stopped), whatever it launched
+    is a working AI, never the flow's own."""
+    mod, home, calls = portal
+    did = []
+    _fb_fakes(mod, monkeypatch, did)
+    mod._newborn_own[4242] = 1
+    mod._newborn_own_save()
+    monkeypatch.setattr(mod, "_claude_processes_sync", lambda: [])
+    r = TestClient(mod.app).post("/api/evolution/first-boot", headers=H).json()
+    assert r["status"] == "fired"
+    assert mod._newborn_own == {} and not mod._NEWBORN_OWN_FILE.exists()
+
+
+def test_one_failed_pane_lookup_is_not_an_exit(portal, monkeypatch):
+    """Final review #5: a single slow tmux call must not fail and kill a helper
+    that is still exchanging the code."""
+    mod, home, calls = portal
+    _expired(home)
+    n = _submit_fakes(mod, monkeypatch, ["Paste code"], write_at=None)
+    real_pane = mod._signin_helper_pane
+    seq = {"i": 0}
+
+    async def flaky():
+        seq["i"] += 1
+        return None if seq["i"] == 3 else await real_pane()
+    monkeypatch.setattr(mod, "_signin_helper_pane", flaky)
+    r = asyncio.run(mod._signin_helper_submit_code("c#s"))
+    assert r["result"] == "pending" and n["closed"] is None

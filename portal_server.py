@@ -2475,8 +2475,35 @@ def _signin_facts_sync():
 
 # The Claude processes this portal's own first sign-in launched in the primary
 # pane: pid -> start time (clock ticks since boot). Recorded right after the
-# launch keys, as a child of the pane's shell with the exact launch argv.
+# launch keys, under the pane's process with the exact launch argv. Kept in a
+# file too, so a portal restart between sign-in and first boot keeps it
+# (pid + start time identify the same process across a portal restart).
 _newborn_own: dict = {}
+_NEWBORN_OWN_FILE = Path.home() / ".portal-signin-own.json"
+
+
+def _newborn_own_save() -> None:
+    try:
+        _NEWBORN_OWN_FILE.write_text(json.dumps({str(k): v for k, v in _newborn_own.items()}))
+    except OSError:
+        pass
+
+
+def _newborn_own_load() -> None:
+    try:
+        data = json.loads(_NEWBORN_OWN_FILE.read_text())
+        for k, v in data.items():
+            _newborn_own.setdefault(int(k), int(v))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+
+
+def _newborn_own_clear() -> None:
+    _newborn_own.clear()
+    try:
+        _NEWBORN_OWN_FILE.unlink()
+    except OSError:
+        pass
 
 
 def _proc_stat_fields(pid: int):
@@ -2496,21 +2523,26 @@ def _proc_start_ticks(pid: int):
         return None
 
 
-def _boot_ticks_now() -> float:
+def _boot_ticks_now():
+    """Clock ticks since boot, or None if it cannot be read."""
     try:
         return float(Path("/proc/uptime").read_text().split()[0]) * os.sysconf("SC_CLK_TCK")
     except (OSError, ValueError, IndexError):
-        return 0.0
+        return None
 
 
 def _newborn_own_pids_sync() -> set:
     """Live processes launched by this portal's own first sign-in (and their children)."""
-    own = set()
+    _newborn_own_load()
+    own, dropped = set(), False
     for pid, start in list(_newborn_own.items()):
         if _proc_start_ticks(pid) != start:
             _newborn_own.pop(pid, None)          # exited (or the pid was reused)
+            dropped = True
             continue
         own |= _descendants_sync(pid)
+    if dropped:
+        _newborn_own_save()
     return own
 
 
@@ -2533,6 +2565,8 @@ def _adopt_children_sync(shell: int, tail: str, since: float) -> list:
                 and pid != shell and _is_under(pid, shell)):
             _newborn_own[pid] = int(f[19])
             found.append(pid)
+    if found:
+        _newborn_own_save()
     return found
 
 
@@ -2540,7 +2574,10 @@ async def _adopt_newborn_launch(pane: str, tail: str) -> None:
     """Right after the first sign-in (or first boot) typed a Claude launch into
     the primary pane, remember that Claude as the flow's own, so the flow's
     later keys and kills are not stopped by it. Read only."""
-    since = _boot_ticks_now() - 3 * os.sysconf("SC_CLK_TCK")
+    now = _boot_ticks_now()
+    if now is None:
+        return                      # cannot tell new from old: adopt nothing
+    since = now - 3 * os.sysconf("SC_CLK_TCK")
     out = (await _run_subprocess_output(
         ["tmux", "display-message", "-p", "-t", pane, "#{pane_pid}"], timeout=3)).strip()
     if not out.isdigit():
@@ -2881,11 +2918,16 @@ async def _signin_helper_submit_code(code: str) -> dict:
             now_fp = _creds_fingerprint()
             return now_fp is not None and now_fp != before and now_fp[1] > time.time() * 1000
 
-        result, t0, done_at, exited = "pending", time.time(), None, False
+        result, t0, done_at, exited, gone = "pending", time.time(), None, False, 0
         while True:
             await asyncio.sleep(0.5)
             hp = await _signin_helper_pane()
-            exited = hp is None or hp["dead"]
+            # gone twice in a row = exited (one slow tmux call is not an exit)
+            gone = gone + 1 if (hp is None or hp["dead"]) else 0
+            exited = gone >= 2
+            if hp is None or hp["dead"]:
+                if not exited:
+                    continue
             if done_at is None:
                 said_done = exited
                 if not exited:
@@ -3257,6 +3299,8 @@ async def api_evolution_first_boot(request: Request) -> JSONResponse:
         return JSONResponse({"status": "stopped_ai_running"})
     finally:
         _newborn_flow_guard.reset(guard)
+        # Whatever first boot launched is now a working AI, never "our own".
+        _newborn_own_clear()
 
 
 async def _first_boot_transition() -> JSONResponse:
