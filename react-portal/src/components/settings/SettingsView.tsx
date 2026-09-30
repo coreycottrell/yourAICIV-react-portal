@@ -7,6 +7,7 @@ import { cn } from '../../utils/cn'
 import { SUPPORT_URL, SUPPORT_LABEL, BRAND_NAME } from '../../utils/brand'
 import { OPERATOR_TOOLS } from '../layout/nav'
 import { useTrialStore } from '../../stores/trialStore'
+import { ReconnectClaudeButton } from '../auth/ReconnectClaudeButton'
 import type { Theme } from '../../types/settings'
 import './SettingsView.css'
 
@@ -52,6 +53,10 @@ export function SettingsView() {
           <div className="settings-row">
             <span className="settings-label">Your name</span>
             <span className="settings-value">{humanName || '—'}</span>
+          </div>
+          <div className="settings-row">
+            <span className="settings-label">Claude sign-in</span>
+            <span className="settings-value"><ReconnectClaudeButton variant="settings" /></span>
           </div>
           <div className="settings-row">
             <span className="settings-label">Version</span>

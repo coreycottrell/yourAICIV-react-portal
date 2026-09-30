@@ -1,10 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { apiGet, apiPost } from '../../api/client'
 import { fireFirstBoot } from '../../api/evolution'
+import { AUTH_CHANGED_EVENT, RECONNECT_EVENT } from './claudeReconnect'
 import './ClaudeAuthFlow.css'
 
 interface AuthStatusResponse {
   authenticated: boolean
+  managed?: boolean
+  reason?: string
   account?: string | null
   expires_at?: number | null
   subscription?: string | null
@@ -12,6 +15,7 @@ interface AuthStatusResponse {
 
 interface StartResponse {
   started?: boolean
+  already_authenticated?: boolean
   error?: string
 }
 
@@ -35,15 +39,35 @@ type FlowStep =
   | 'verifying'
   | 'success'
 
+/** How long a reconnect waits for NEW credentials before saying so. */
+const RECONNECT_VERIFY_TIMEOUT_MS = 120_000
+
+/**
+ * The Connect Claude flow.
+ *
+ * Opens by itself when /api/auth/status says Claude is not signed in (first
+ * sign-in after birth: success fires the first-boot awakening). Also opens on
+ * demand from the "Reconnect Claude" button (RECONNECT_EVENT) while Claude IS
+ * signed in, so the owner can sign in again or switch accounts. A reconnect
+ * never fires the first-boot awakening, and it is only called done when the
+ * status shows a NEW sign-in (the old, still-valid token does not count).
+ */
 export function ClaudeAuthFlow() {
   const [step, setStep] = useState<FlowStep>('checking')
   const [authUrl, setAuthUrl] = useState<string | null>(null)
   const [code, setCode] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [authenticated, setAuthenticated] = useState(false)
+  // Opened from the Reconnect Claude button (not because Claude is signed out).
+  const [reconnectMode, setReconnectMode] = useState(false)
 
   const urlPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const statusPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Reconnect: the status snapshot taken when the flow opened, to tell a new
+  // sign-in apart from the old token that is still valid.
+  const baselineRef = useRef<AuthStatusResponse | null>(null)
+  const reconnectRef = useRef(false)
 
   const clearPolls = useCallback(() => {
     if (urlPollRef.current) {
@@ -53,6 +77,10 @@ export function ClaudeAuthFlow() {
     if (statusPollRef.current) {
       clearInterval(statusPollRef.current)
       statusPollRef.current = null
+    }
+    if (closeTimerRef.current) {
+      clearTimeout(closeTimerRef.current)
+      closeTimerRef.current = null
     }
   }, [])
 
@@ -78,6 +106,48 @@ export function ClaudeAuthFlow() {
       })
     return () => { cancelled = true }
   }, [])
+
+  // "Reconnect Claude" button: open the flow even while signed in.
+  useEffect(() => {
+    const onReconnect = () => {
+      clearPolls()
+      setError(null)
+      setAuthUrl(null)
+      setCode('')
+      baselineRef.current = null
+      apiGet<AuthStatusResponse>('/api/auth/status')
+        .then(res => {
+          baselineRef.current = res
+          // Signed out right now: this is an ordinary sign-in, not a reconnect.
+          reconnectRef.current = !!res.authenticated
+          setReconnectMode(!!res.authenticated)
+        })
+        .catch(() => {
+          reconnectRef.current = true
+          setReconnectMode(true)
+        })
+      reconnectRef.current = true
+      setReconnectMode(true)
+      setAuthenticated(false)
+      setStep('idle')
+    }
+    window.addEventListener(RECONNECT_EVENT, onReconnect)
+    return () => window.removeEventListener(RECONNECT_EVENT, onReconnect)
+  }, [clearPolls])
+
+  const closeFlow = useCallback(() => {
+    clearPolls()
+    // Leave the AI's own pane clean: close the login picker / code prompt
+    // (cancel) or the "Press Enter to continue" screen (after success).
+    apiPost('/api/auth/close').catch(() => {})
+    reconnectRef.current = false
+    setReconnectMode(false)
+    setError(null)
+    setAuthUrl(null)
+    setCode('')
+    setAuthenticated(true)
+    setStep('idle')
+  }, [clearPolls])
 
   const handleStart = useCallback(async () => {
     setError(null)
@@ -114,6 +184,16 @@ export function ClaudeAuthFlow() {
     }
   }, [])
 
+  const isNewSignIn = (s: AuthStatusResponse): boolean => {
+    if (!s.authenticated) return false
+    if (!reconnectRef.current) return true
+    const base = baselineRef.current
+    // Signed out when the reconnect began -> any sign-in is new.
+    if (!base || !base.authenticated) return true
+    // Signed in when it began: only fresh credentials count.
+    return s.expires_at != null && s.expires_at !== base.expires_at
+  }
+
   const handleSubmitCode = useCallback(async () => {
     if (!code.trim()) return
     setError(null)
@@ -127,20 +207,35 @@ export function ClaudeAuthFlow() {
       }
       if (res.injected) {
         setStep('verifying')
+        const startedAt = Date.now()
         // Poll auth status
         statusPollRef.current = setInterval(async () => {
           try {
             const statusRes = await apiGet<AuthStatusResponse>('/api/auth/status')
-            if (statusRes.authenticated) {
+            if (isNewSignIn(statusRes)) {
               if (statusPollRef.current) {
                 clearInterval(statusPollRef.current)
                 statusPollRef.current = null
+              }
+              window.dispatchEvent(new CustomEvent(AUTH_CHANGED_EVENT))
+              if (reconnectRef.current) {
+                // Reconnect is not a birth: never re-run the awakening.
+                setStep('success')
+                closeTimerRef.current = setTimeout(closeFlow, 2500)
+                return
               }
               // Auth confirmed — fire evolution and dismiss immediately.
               // Do NOT wait for evolution to complete (takes 10+ min).
               // Human watches evolution in terminal/chat.
               fireFirstBoot().catch(() => {})
               setAuthenticated(true)
+            } else if (reconnectRef.current && Date.now() - startedAt > RECONNECT_VERIFY_TIMEOUT_MS) {
+              if (statusPollRef.current) {
+                clearInterval(statusPollRef.current)
+                statusPollRef.current = null
+              }
+              setError('The new sign-in was not confirmed. Open the authorization page again, copy the new code, and paste it here.')
+              setStep('url-ready')
             }
           } catch {
             // Keep polling on transient errors
@@ -151,33 +246,44 @@ export function ClaudeAuthFlow() {
       setError(err instanceof Error ? err.message : 'Failed to submit code')
       setStep('url-ready')
     }
-  }, [code])
+  }, [code, closeFlow])
 
-  // triggerEvolution removed — fire-and-forget in submitCode, dismiss immediately
-
-  // Render nothing if authenticated or skipped
+  // Render nothing if authenticated (and no reconnect was asked for)
   if (authenticated) return null
   if (step === 'checking') return null
 
+  const title = reconnectMode ? 'Reconnect Claude' : 'Connect Your Claude Account'
+  const desc = reconnectMode
+    ? 'Sign in to Claude again, or sign in with a different Claude account. Your AI keeps its memory, identity and files.'
+    : 'Claude needs to authenticate before it can run. This takes about 2 minutes.'
+
   return (
-    <div className="claude-auth-overlay">
+    <div className="claude-auth-overlay" role="dialog" aria-modal="true" aria-label={title}>
       <div className="claude-auth-box">
+        {reconnectMode && step !== 'success' && (
+          <button
+            type="button"
+            className="claude-auth-close"
+            onClick={closeFlow}
+            aria-label="Cancel reconnect"
+          >
+            {'×'}
+          </button>
+        )}
         {step === 'success' ? (
-          <div className="claude-auth-success">{'\u2705'} Claude authenticated successfully!</div>
+          <div className="claude-auth-success">{'✅'} Claude is signed in again.</div>
         ) : (
           <>
-            <div className="claude-auth-icon">{'\uD83D\uDD10'}</div>
-            <div className="claude-auth-title">Connect Your Claude Account</div>
-            <div className="claude-auth-desc">
-              Claude needs to authenticate before it can run. This takes about 2 minutes.
-            </div>
+            <div className="claude-auth-icon">{'🔐'}</div>
+            <div className="claude-auth-title">{title}</div>
+            <div className="claude-auth-desc">{desc}</div>
             <div className="claude-auth-note">
               You'll be redirected to claude.ai to authorize.
             </div>
 
             {step === 'idle' && (
               <button className="claude-auth-btn" onClick={handleStart}>
-                Authenticate Now
+                {reconnectMode ? 'Start sign-in' : 'Authenticate Now'}
               </button>
             )}
 

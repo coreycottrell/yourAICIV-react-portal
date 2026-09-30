@@ -9,6 +9,7 @@
 }
 
 .claude-auth-box {
+  position: relative;
   max-width: 480px;
   width: 90%;
   padding: 40px;
@@ -169,4 +170,33 @@
 @keyframes spin {
   0% { transform: rotate(0deg); }
   100% { transform: rotate(360deg); }
+}
+
+/* Cancel (x) — only shown for a Reconnect, never for the first sign-in */
+.claude-auth-close {
+  position: absolute;
+  top: 12px;
+  right: 14px;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.claude-auth-close:hover {
+  background: var(--surface-card);
+  color: var(--text-primary);
+}
+
+.claude-auth-close:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
 }
