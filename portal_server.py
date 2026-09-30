@@ -194,7 +194,11 @@ _captured_oauth_url = None
 
 # t3383: an established CIV signs in to Claude in this separate tmux session,
 # which the portal owns, so the AI's own pane is never typed into or stopped.
+# It runs on its OWN tmux server (tmux -L portal-signin), so nothing that looks
+# for the AI's session (this portal, a bridge, a BOOP injector) can ever find it.
 SIGNIN_HELPER_SESSION = "portal-signin"
+SIGNIN_HELPER_SOCKET = "portal-signin"
+_HELPER_TMUX = ["tmux", "-L", SIGNIN_HELPER_SOCKET]
 
 # Evolution markers
 EVOLUTION_DONE_MARKER = Path.home() / "memories" / "identity" / ".evolution-done"
@@ -303,7 +307,7 @@ def get_tmux_session() -> str:
             parts = line.strip().rsplit(":", 1)
             if len(parts) == 2 and parts[1].strip().isdigit() and int(parts[1].strip()) > 0:
                 attached = parts[0].strip()
-                if attached and attached != SIGNIN_HELPER_SESSION:
+                if attached:
                     result = attached
                     break
     except Exception:
@@ -313,14 +317,14 @@ def get_tmux_session() -> str:
         marker = Path.home() / ".current_session"
         if marker.exists():
             name = marker.read_text().strip()
-            if name and name != SIGNIN_HELPER_SESSION and alive(name):
+            if name and alive(name):
                 result = name
 
     if not result:
         try:
             out = subprocess.check_output(["tmux", "list-sessions", "-F", "#{session_name}"],
                                           stderr=subprocess.DEVNULL, text=True, timeout=3)
-            sessions = [x for x in out.strip().splitlines() if x.strip() != SIGNIN_HELPER_SESSION]
+            sessions = out.strip().splitlines()
             for line in sessions:
                 if CIV_NAME in line.lower():
                     result = line.strip()
@@ -1888,27 +1892,28 @@ _auth_prewarm_task = None  # background prewarm task handle
 
 
 async def _is_claude_running_async(pane: str) -> bool:
-    """Check if Claude Code is the active process in the given tmux pane."""
+    """Check if Claude Code is the active process in the given tmux pane.
+    t3383: this used _run_subprocess_async, which discards stdout, so it always
+    returned False. It now reads the pane's command."""
     try:
-        r = await _run_subprocess_async(
+        out = await _run_subprocess_output(
             ["tmux", "display-message", "-t", pane, "-p", "#{pane_current_command}"],
             timeout=3
         )
-        if r and r.stdout:
-            cmd = r.stdout.strip().lower()
-            return "claude" in cmd or "node" in cmd
+        cmd = (out or "").strip().lower()
+        return "claude" in cmd or "node" in cmd
     except Exception:
         pass
     return False
 
 
-async def _detect_auth_screen(pane: str) -> tuple:
+async def _detect_auth_screen(pane: str, tmux_cmd=("tmux",)) -> tuple:
     """Capture tmux pane and detect what's currently displayed.
     Returns (screen_type, raw_content) where screen_type is one of the
     AUTH_SCREEN_PATTERNS keys or 'unknown'/'empty'.
     """
     content = await _run_subprocess_output(
-        ["tmux", "capture-pane", "-t", pane, "-p", "-J", "-S", "-300"], timeout=5
+        list(tmux_cmd) + ["capture-pane", "-t", pane, "-p", "-J", "-S", "-300"], timeout=5
     )
     if not content:
         return 'empty', ''
@@ -1943,15 +1948,22 @@ async def _dismiss_auth_blocker(pane: str, screen_type: str) -> bool:
     return False
 
 
-async def _kill_claude_process() -> None:
-    """Kill any running Claude process in this container."""
+async def _kill_claude_process(pane: str = None) -> None:
+    """Stop the Claude processes in the primary pane's own process tree.
+    t3383: this was a container-wide kill by name, which also stopped an AI
+    running anywhere else in the container. It now sends SIGTERM (the same
+    signal as before) only to Claude processes under the primary pane."""
     if _newborn_flow_guard.get():
         # t3383: inside the first sign-in flow, re-check before EVERY kill.
         await _newborn_guard_check("kill")
-    await _run_subprocess_output(
-        ["bash", "-c", "pkill -f 'claude' 2>/dev/null; pkill -f 'node.*claude' 2>/dev/null; true"],
-        timeout=5,
-    )
+    if pane is None:
+        pane = await _find_primary_pane_async()
+    out = (await _run_subprocess_output(
+        ["tmux", "display-message", "-p", "-t", pane, "#{pane_pid}"], timeout=3)).strip()
+    if not out.isdigit():
+        return
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _kill_claude_in_tree_sync, int(out))
 
 
 async def _run_auth_state_machine(pane: str) -> dict:
@@ -1992,6 +2004,7 @@ async def _run_auth_state_machine(pane: str) -> dict:
             launch_cmd = f"clear && cd {Path.home()} && claude /login"
             await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "-l", launch_cmd], check=True)
             await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
+            await _adopt_newborn_launch(pane, "/login")   # t3383: read only
         else:
             log("Claude already running — sending /login")
             await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "-l", "/login"], check=True)
@@ -2049,11 +2062,11 @@ async def _run_auth_state_machine(pane: str) -> dict:
         retry_count += 1
         if retry_count <= max_retries:
             log(f"Killing Claude for clean restart (retry {retry_count}/{max_retries})")
-            await _kill_claude_process()
+            await _kill_claude_process(pane)
             await asyncio.sleep(2.0)
             # Verify it's dead
             if await _is_claude_running_async(pane):
-                await _kill_claude_process()
+                await _kill_claude_process(pane)
                 await asyncio.sleep(2.0)
             # Clear tmux scrollback before next attempt so stale error text cannot poison detection
             await _run_subprocess_async(["tmux", "clear-history", "-t", pane])
@@ -2291,7 +2304,10 @@ async def _established_ai_running() -> bool:
 # its next request; nothing is restarted.
 # ---------------------------------------------------------------------------
 
-_newborn_flow_guard = contextvars.ContextVar("t3383_newborn_flow_guard", default=False)
+# None outside a guarded flow; "signin" inside the first sign-in flow (every
+# key/kill needs a newborn with no AI); "first_boot" inside first boot (every
+# key/kill needs no AI other than the flow's own Claude).
+_newborn_flow_guard = contextvars.ContextVar("t3383_newborn_flow_guard", default=None)
 _SIGNIN_HELPER_TARGET = f"={SIGNIN_HELPER_SESSION}"   # '=' = exact session name
 _SIGNIN_HELPER_MAX_AGE = 15 * 60
 _signin_helper_started = 0.0
@@ -2305,11 +2321,28 @@ class _SigninGuardStop(Exception):
     """A sign-in step stopped because it could reach a running AI."""
 
 
+_TMUX_OPTS_WITH_ARG = {"-L", "-S", "-f", "-c", "-T"}
+
+
+def _tmux_subcommand(cmd):
+    """The tmux command name in argv (after global options such as -L/-S), or None."""
+    if not (isinstance(cmd, (list, tuple)) and cmd and os.path.basename(str(cmd[0])) == "tmux"):
+        return None
+    i = 1
+    while i < len(cmd):
+        a = str(cmd[i])
+        if a in _TMUX_OPTS_WITH_ARG:
+            i += 2
+        elif a.startswith("-"):
+            i += 1
+        else:
+            return a
+    return None
+
+
 def _is_send_keys(cmd) -> bool:
     """A tmux command that types into or changes a pane (keys, scrollback clear, resize)."""
-    return (isinstance(cmd, (list, tuple)) and len(cmd) > 1
-            and os.path.basename(str(cmd[0])) == "tmux"
-            and any(str(c) in ("send-keys", "clear-history", "resize-window") for c in cmd[1:3]))
+    return _tmux_subcommand(cmd) in ("send-keys", "clear-history", "resize-window")
 
 
 def _argv_is_signin_only(argv: list) -> bool:
@@ -2440,23 +2473,144 @@ def _signin_facts_sync():
     return _civ_is_established(), _ai_processes_sync()
 
 
+# The Claude processes this portal's own first sign-in launched in the primary
+# pane: pid -> start time (clock ticks since boot). Recorded right after the
+# launch keys, as a child of the pane's shell with the exact launch argv.
+_newborn_own: dict = {}
+
+
+def _proc_stat_fields(pid: int):
+    """/proc/<pid>/stat fields after the command name, or None."""
+    try:
+        st = Path(f"/proc/{pid}/stat").read_text()
+        return st[st.rindex(")") + 2:].split()
+    except (OSError, ValueError):
+        return None
+
+
+def _proc_start_ticks(pid: int):
+    f = _proc_stat_fields(pid)
+    try:
+        return int(f[19]) if f else None
+    except (IndexError, ValueError):
+        return None
+
+
+def _boot_ticks_now() -> float:
+    try:
+        return float(Path("/proc/uptime").read_text().split()[0]) * os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def _newborn_own_pids_sync() -> set:
+    """Live processes launched by this portal's own first sign-in (and their children)."""
+    own = set()
+    for pid, start in list(_newborn_own.items()):
+        if _proc_start_ticks(pid) != start:
+            _newborn_own.pop(pid, None)          # exited (or the pid was reused)
+            continue
+        own |= _descendants_sync(pid)
+    return own
+
+
+def _adopt_children_sync(shell: int, tail: str, since: float) -> list:
+    """Claude processes under the pane process `shell`, run exactly `claude <tail>`,
+    and started at or after `since` (clock ticks). Records them as the flow's own."""
+    found = []
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        pid = int(d.name)
+        f = _proc_stat_fields(pid)
+        try:
+            if not f or int(f[19]) < since:
+                continue
+        except (IndexError, ValueError):
+            continue
+        argv = _proc_argv(pid)
+        if (argv and _argv_is_claude(argv) and argv[-1] == tail and pid not in _newborn_own
+                and pid != shell and _is_under(pid, shell)):
+            _newborn_own[pid] = int(f[19])
+            found.append(pid)
+    return found
+
+
+async def _adopt_newborn_launch(pane: str, tail: str) -> None:
+    """Right after the first sign-in (or first boot) typed a Claude launch into
+    the primary pane, remember that Claude as the flow's own, so the flow's
+    later keys and kills are not stopped by it. Read only."""
+    since = _boot_ticks_now() - 3 * os.sysconf("SC_CLK_TCK")
+    out = (await _run_subprocess_output(
+        ["tmux", "display-message", "-p", "-t", pane, "#{pane_pid}"], timeout=3)).strip()
+    if not out.isdigit():
+        return
+    loop = asyncio.get_event_loop()
+    for _ in range(20):
+        if await loop.run_in_executor(None, _adopt_children_sync, int(out), tail, since):
+            return
+        await asyncio.sleep(0.25)
+
+
+def _foreign_ai_sync():
+    """Working-AI pids other than the first sign-in's own Claude; None = cannot tell."""
+    ai = _ai_processes_sync()
+    if ai is None:
+        return None
+    own = _newborn_own_pids_sync() if ai else set()
+    return [p for p in ai if p not in own]
+
+
 def _signin_mode_sync() -> str:
     """'newborn' only when the CIV has never signed in AND no AI runs here.
     Anything else, including 'cannot tell', is 'helper'."""
     if _civ_is_established():
         return "helper"
-    ai = _ai_processes_sync()
+    ai = _foreign_ai_sync()
     if ai is None or ai:
         return "helper"
     return "newborn"
 
 
 async def _newborn_guard_check(what: str) -> None:
-    """Inside the first sign-in flow: stop before a key or a kill if the CIV
-    is no longer a newborn with no AI running."""
+    """Inside a guarded flow: stop before a key or a kill if an AI could be
+    reached. First sign-in: the CIV must still be a newborn with no AI. First
+    boot (its marker is already written): no AI other than the flow's own."""
     loop = asyncio.get_event_loop()
+    if _newborn_flow_guard.get() == "first_boot":
+        ai = await loop.run_in_executor(None, _foreign_ai_sync)
+        if ai is None or ai:
+            raise _SigninGuardStop(f"{what}: an AI is running")
+        return
     if await loop.run_in_executor(None, _signin_mode_sync) != "newborn":
         raise _SigninGuardStop(f"{what}: an AI is running or this CIV is established")
+
+
+def _is_claude_to_stop(argv: list) -> bool:
+    """What main's `pkill -f claude` / `pkill -f 'node.*claude'` meant to stop."""
+    if _argv_is_claude(argv):
+        return True
+    return bool(argv) and os.path.basename(argv[0]).startswith("node") and any("claude" in a for a in argv[1:])
+
+
+def _kill_claude_in_tree_sync(root: int) -> list:
+    """SIGTERM the Claude processes in root's process tree only (never the
+    portal). Each kill re-checks the process is the same one, still under root."""
+    snapshot = {}
+    for pid in _descendants_sync(root):
+        argv = _proc_argv(pid)
+        if pid != os.getpid() and argv and _is_claude_to_stop(argv):
+            snapshot[pid] = argv
+    killed = []
+    for pid, argv in snapshot.items():
+        if _proc_argv(pid) != argv or not _is_under(pid, root):
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return killed
 
 
 def _signin_helper_lock() -> asyncio.Lock:
@@ -2510,8 +2664,8 @@ def _descendants_sync(root: int) -> set:
 async def _signin_helper_pane():
     """The helper session's one pane: {'pane_id', 'pane_pid', 'dead'}, or None."""
     out = await _run_subprocess_output(
-        ["tmux", "list-panes", "-s", "-t", _SIGNIN_HELPER_TARGET,
-         "-F", "#{pane_id}\t#{pane_pid}\t#{session_name}\t#{pane_dead}"], timeout=3)
+        _HELPER_TMUX + ["list-panes", "-s", "-t", _SIGNIN_HELPER_TARGET,
+                        "-F", "#{pane_id}\t#{pane_pid}\t#{session_name}\t#{pane_dead}"], timeout=3)
     rows = [line.split("\t") for line in (out or "").splitlines() if line.strip()]
     rows = [r for r in rows if len(r) == 4 and r[2] == SIGNIN_HELPER_SESSION and r[1].isdigit()]
     if len(rows) != 1:
@@ -2531,19 +2685,18 @@ async def _primary_pane_pids() -> set:
 
 
 async def _signin_helper_send(*keys: str, literal: bool = False) -> None:
-    """Send keys to the helper pane only. Re-checks, right before the key,
-    that the target is the helper session's pane and not the AI's pane."""
+    """Send keys to the helper pane only. Every command goes to the helper's
+    own tmux server, which holds no other session; right before the key it
+    re-checks that the pane is the live helper session's pane."""
     hp = await _signin_helper_pane()
     if hp is None or hp["dead"]:
         raise _SigninGuardStop("the sign-in window is gone")
     pane_id = hp["pane_id"]
-    if pane_id == await _find_primary_pane_async():
-        raise _SigninGuardStop("the sign-in window resolved to the AI's pane")
     owner = (await _run_subprocess_output(
-        ["tmux", "display-message", "-p", "-t", pane_id, "#{session_name}"], timeout=3)).strip()
+        _HELPER_TMUX + ["display-message", "-p", "-t", pane_id, "#{session_name}"], timeout=3)).strip()
     if owner != SIGNIN_HELPER_SESSION:
         raise _SigninGuardStop("the sign-in window is not the helper session")
-    cmd = ["tmux", "send-keys", "-t", pane_id] + (["-l"] if literal else []) + list(keys)
+    cmd = _HELPER_TMUX + ["send-keys", "-t", pane_id] + (["-l"] if literal else []) + list(keys)
     if await _run_subprocess_async(cmd, check=True) is None:
         raise _SigninGuardStop("could not type into the sign-in window")
 
@@ -2591,7 +2744,7 @@ async def _close_signin_helper(reason: str) -> bool:
                 break
     hp2 = await _signin_helper_pane()
     if hp2 is not None and hp2["pane_id"] == hp["pane_id"]:
-        await _run_subprocess_async(["tmux", "kill-session", "-t", _SIGNIN_HELPER_TARGET])
+        await _run_subprocess_async(_HELPER_TMUX + ["kill-session", "-t", _SIGNIN_HELPER_TARGET])
     _save_portal_message(f"[signin-helper] closed ({reason})", role="assistant")
     return True
 
@@ -2673,8 +2826,8 @@ async def _run_signin_helper() -> dict:
                 _signin_helper_started = started
                 cmd = "exec " + " ".join(shlex.quote(a) for a in argv)
                 launched = await _run_subprocess_async(
-                    ["tmux", "new-session", "-d", "-s", SIGNIN_HELPER_SESSION,
-                     "-x", "500", "-y", "50", "-c", str(Path.home()), cmd], check=True)
+                    _HELPER_TMUX + ["new-session", "-d", "-s", SIGNIN_HELPER_SESSION,
+                                    "-x", "500", "-y", "50", "-c", str(Path.home()), cmd], check=True)
                 if launched is None:
                     continue
                 _save_portal_message(f"[signin-helper] started (attempt {attempt + 1}/2)", role="assistant")
@@ -2684,7 +2837,7 @@ async def _run_signin_helper() -> dict:
                     hp = await _signin_helper_pane()
                     if hp is None or hp["dead"]:
                         break
-                    screen, content = await _detect_auth_screen(hp["pane_id"])
+                    screen, content = await _detect_auth_screen(hp["pane_id"], _HELPER_TMUX)
                     if screen == "oauth_url":
                         match = OAUTH_URL_PATTERN.search(content)
                         if match and "state=" in match.group(0):
@@ -2712,7 +2865,10 @@ async def _run_signin_helper() -> dict:
 
 
 async def _signin_helper_submit_code(code: str) -> dict:
-    """Paste the code into the helper and wait (up to 30s) for the result."""
+    """Paste the code into the helper and wait for the result. Signed in means
+    the credentials file was actually rewritten with a new, unexpired sign-in
+    that parses. The helper is never stopped before that, except after a
+    bounded wait (it exited without writing, or it wrote nothing in time)."""
     async with _signin_helper_lock():
         before = _creds_fingerprint()
         try:
@@ -2720,22 +2876,49 @@ async def _signin_helper_submit_code(code: str) -> dict:
             await _signin_helper_send("Enter")
         except _SigninGuardStop:
             return {"mode": "helper", "error": "The sign-in window has closed. Please start the sign-in again."}
-        result = "pending"
-        for _ in range(60):
+
+        def rewritten():
+            now_fp = _creds_fingerprint()
+            return now_fp is not None and now_fp != before and now_fp[1] > time.time() * 1000
+
+        result, t0, done_at, exited = "pending", time.time(), None, False
+        while True:
             await asyncio.sleep(0.5)
             hp = await _signin_helper_pane()
-            finished = hp is None or hp["dead"]
-            if not finished:
-                _screen, content = await _detect_auth_screen(hp["pane_id"])
-                finished = bool(AUTH_SCREEN_PATTERNS["logged_in"].search(content or ""))
-            if not finished:
-                continue    # never stop the helper mid-exchange
-            now_fp = _creds_fingerprint()
-            changed = now_fp is not None and now_fp != before and now_fp[1] > time.time() * 1000
-            result = "signed_in" if changed else "failed"
-            break
+            exited = hp is None or hp["dead"]
+            if done_at is None:
+                said_done = exited
+                if not exited:
+                    _screen, content = await _detect_auth_screen(hp["pane_id"], _HELPER_TMUX)
+                    said_done = bool(AUTH_SCREEN_PATTERNS["logged_in"].search(content or ""))
+                if said_done:
+                    done_at = time.time()
+            # Checked after the helper's state, so a write-then-exit is never
+            # read as a failure; and only once the helper said it finished, so
+            # the AI's own token refresh is never taken for this sign-in.
+            if done_at is not None and rewritten():
+                result = "signed_in"
+                break
+            if done_at is not None:
+                # The helper said it finished (or exited): wait for the file,
+                # 2s after an exit, 15s while it is still up.
+                if time.time() - done_at > (2.0 if exited else 15.0):
+                    result = "failed"
+                    break
+            elif time.time() - t0 > 30.0:
+                break                          # still exchanging: leave it running (reaper closes it)
         if result == "signed_in":
-            await asyncio.sleep(1.0)
+            # The file is written; let the helper finish on its own (it may
+            # still save account details), up to 10s, before closing it.
+            for _ in range(20):
+                hp = await _signin_helper_pane()
+                if hp is None or hp["dead"]:
+                    break
+                _screen, content = await _detect_auth_screen(hp["pane_id"], _HELPER_TMUX)
+                if AUTH_SCREEN_PATTERNS["logged_in"].search(content or ""):
+                    await asyncio.sleep(1.0)
+                    break
+                await asyncio.sleep(0.5)
             await _close_signin_helper("signed in")
         elif result == "failed":
             await _close_signin_helper("sign-in failed")
@@ -2844,7 +3027,7 @@ async def api_claude_auth_start(request: Request) -> JSONResponse:
         await _close_signin_helper("newborn sign-in")
     pane = await _find_primary_pane_async()
     _save_portal_message(f"Auth flow v2 started — {get_tmux_session()} (pane {pane})", role="assistant")
-    guard = _newborn_flow_guard.set(True)
+    guard = _newborn_flow_guard.set("signin")
     try:
         result = await _run_auth_state_machine(pane)
         return JSONResponse(result)
@@ -2878,7 +3061,7 @@ async def api_claude_auth_prewarm(request: Request) -> JSONResponse:
         return JSONResponse({"status": "skipped", "mode": "helper"})
     pane = await _find_primary_pane_async()
     _save_portal_message("Pre-warming Claude for auth...", role="assistant")
-    guard = _newborn_flow_guard.set(True)
+    guard = _newborn_flow_guard.set("signin")
     try:
         # Resize tmux
         await _run_subprocess_async(["tmux", "resize-window", "-t", pane, "-x", "500"])
@@ -2888,6 +3071,7 @@ async def api_claude_auth_prewarm(request: Request) -> JSONResponse:
             launch_cmd = f"cd {Path.home()} && claude /login"
             await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "-l", launch_cmd], check=True)
             await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
+            await _adopt_newborn_launch(pane, "/login")   # t3383: read only
             _save_portal_message("Pre-warm: Claude /login launched in background", role="assistant")
         else:
             _save_portal_message("Pre-warm: Claude already running", role="assistant")
@@ -2920,7 +3104,7 @@ async def api_claude_auth_code(request: Request) -> JSONResponse:
                              "error": "The sign-in window has closed. Please start the sign-in again."})
     pane = await _find_primary_pane_async()
     _save_portal_message(f"Auth code submitted — injecting into {get_tmux_session()}...", role="assistant")
-    guard = _newborn_flow_guard.set(True)
+    guard = _newborn_flow_guard.set("signin")
     try:
         r = await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "-l", code], check=True)
         if r is None:
@@ -2956,8 +3140,9 @@ async def api_claude_auth_url(request: Request) -> JSONResponse:
         return JSONResponse({"url": _captured_oauth_url, "ready": True})
     # t3383: read the helper's pane; never scrape the AI's pane of a non-newborn.
     helper = await _signin_helper_pane()
+    tmux_cmd = ["tmux"]
     if helper is not None:
-        pane = helper["pane_id"]
+        pane, tmux_cmd = helper["pane_id"], list(_HELPER_TMUX)
     else:
         loop = asyncio.get_event_loop()
         if await loop.run_in_executor(None, _signin_mode_sync) != "newborn":
@@ -2966,7 +3151,7 @@ async def api_claude_auth_url(request: Request) -> JSONResponse:
     try:
         # -J joins wrapped lines so long URLs aren't truncated at terminal width
         content = await _run_subprocess_output(
-            ["tmux", "capture-pane", "-t", pane, "-p", "-J", "-S", "-200"], timeout=5
+            tmux_cmd + ["capture-pane", "-t", pane, "-p", "-J", "-S", "-200"], timeout=5
         )
         if not content:
             return JSONResponse({"url": None, "ready": False})
@@ -3042,11 +3227,15 @@ async def api_evolution_first_boot(request: Request) -> JSONResponse:
         return JSONResponse({"status": "already_evolved"})
     if FIRST_BOOT_MARKER.exists():
         return JSONResponse({"status": "already_fired"})
-    # t3383: a CIV with no marker that has already worked (any real turn, in
-    # any project) is not a newborn: never stop its AI or type an awakening
-    # into it. A Claude that has never made a turn has no work to lose, so a
-    # newborn with a stray, never-used Claude still gets main's awakening.
+    # t3383: never stop an AI or type an awakening into one. Refuse when any
+    # working AI process runs anywhere in the container (whoever owns it),
+    # other than the sign-in Claude this portal's own first sign-in launched
+    # in the primary pane; and refuse a CIV that has already worked (any real
+    # turn, in any project). Then every key and kill below re-checks.
     loop = asyncio.get_event_loop()
+    foreign = await loop.run_in_executor(None, _foreign_ai_sync)
+    if foreign is None or foreign:
+        return JSONResponse({"status": "skipped_ai_running"})
     if await loop.run_in_executor(None, _primary_has_real_turn):
         return JSONResponse({"status": "skipped_not_newborn"})
     # Write marker before launching — prevents double-fire on concurrent calls
@@ -3054,13 +3243,30 @@ async def api_evolution_first_boot(request: Request) -> JSONResponse:
         FIRST_BOOT_MARKER.write_text(str(time.time()))
     except Exception as e:
         return JSONResponse({"error": f"could not write marker: {e}"}, status_code=500)
+    guard = _newborn_flow_guard.set("first_boot")
+    try:
+        return await _first_boot_transition()
+    except _SigninGuardStop as e:
+        # Remove our own marker so a later call can re-check (it refuses
+        # again while an AI runs); a stopped first boot is not a fired one.
+        try:
+            FIRST_BOOT_MARKER.unlink()
+        except OSError:
+            pass
+        _save_portal_message(f"Evolution not started: {e}", role="assistant")
+        return JSONResponse({"status": "stopped_ai_running"})
+    finally:
+        _newborn_flow_guard.reset(guard)
 
+
+async def _first_boot_transition() -> JSONResponse:
+    """main's first-boot steps, run under the t3383 per-key/per-kill guard."""
     pane = await _find_primary_pane_async()
     project_dir = str(Path.home())
 
     # Step 1: Double Ctrl-C to kill the /login Claude instance in the same pane
     _save_portal_message("Auth complete — transitioning to evolution (same pane)...", role="assistant")
-    await _kill_claude_process()
+    await _kill_claude_process(pane)
 
     # Step 2: Wait for Claude to exit (up to 10s)
     exited = False
@@ -3082,6 +3288,8 @@ async def api_evolution_first_boot(request: Request) -> JSONResponse:
     if r is None:
         return JSONResponse({"error": "tmux send-keys timed out"}, status_code=500)
     await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
+    t_launch = time.time()
+    await _adopt_newborn_launch(pane, "--dangerously-skip-permissions")   # t3383: read only
 
     # Write session marker for tracking
     marker = Path.home() / ".current_session"
@@ -3096,6 +3304,11 @@ async def api_evolution_first_boot(request: Request) -> JSONResponse:
             break
     if not started:
         _save_portal_message("Claude session didn't confirm within 30s — proceeding with evolution anyway", role="assistant")
+    else:
+        # t3383: main's running-check never saw Claude start, so main always
+        # typed the awakening 30s after launch. Keep that, so a fresh Claude
+        # has finished starting before the prompt arrives.
+        await asyncio.sleep(max(0.0, 30.0 - (time.time() - t_launch)))
 
     # Step 5: Inject the awakening prompt
     prompt_text = _extract_evolution_prompt(FIRST_BOOT_SKILL_PATH, FIRST_BOOT_PROMPT_PATH)
@@ -3110,6 +3323,8 @@ async def api_evolution_first_boot(request: Request) -> JSONResponse:
         await asyncio.sleep(0.5)
         await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"])
         return JSONResponse({"status": "fired", "message": "Evolution started (same-pane transition)"})
+    except _SigninGuardStop:
+        raise
     except Exception as e:
         _save_portal_message(f"Evolution injection failed: {e}", role="assistant")
         return JSONResponse({"error": f"tmux error: {e}"}, status_code=500)

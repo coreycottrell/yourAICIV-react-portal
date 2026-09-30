@@ -222,22 +222,6 @@ def test_newborn_code_is_still_typed_into_the_primary_pane(portal, monkeypatch):
     assert typed == [["tmux", "send-keys", "-t", "%7", "-l", "CODE#STATE"], ["tmux", "send-keys", "-t", "%7", "Enter"]]
 
 
-def test_tmux_session_never_resolves_to_the_helper(portal, monkeypatch):
-    mod, home, _ = portal
-
-    def fake_check_output(cmd, *a, **kw):
-        if "list-sessions" in cmd and "#{session_name}:#{session_attached}" in cmd:
-            return "portal-signin:1\n"
-        if "list-sessions" in cmd:
-            return "portal-signin\nzeta-primary\n"
-        return ""
-
-    monkeypatch.setattr(mod.subprocess, "check_output", fake_check_output)
-    mod._tmux_session_cache = (0.0, "")
-    (home / ".current_session").write_text("portal-signin")
-    assert mod.get_tmux_session() == "zeta-primary"
-
-
 def test_descendants_scope(portal):
     mod, home, _ = portal
     p = subprocess.Popen(["bash", "-c", "sleep 30 & wait"])
@@ -281,40 +265,6 @@ def test_live_session_ignores_the_helper_process(portal, monkeypatch):
     monkeypatch.setattr(mod, "_proc_argv", lambda pid: ["/x/claude", "auth", "login"])
     s = TestClient(mod.app).get("/api/auth/status", headers=H).json()
     assert s["live_session"] is False and s["signin_mode"] == "helper"
-
-
-def test_first_boot_still_fires_for_a_newborn_with_a_stray_claude(portal, monkeypatch):
-    """A newborn that has never worked keeps main's awakening even if some
-    Claude process is up (review r0 #1)."""
-    mod, home, calls = portal
-    monkeypatch.setattr(mod, "_claude_processes_sync", lambda: [os.getpid()])
-    monkeypatch.setattr(mod, "_proc_argv", lambda pid: ["claude", "--dangerously-skip-permissions"])
-    assert mod._signin_mode_sync() == "helper"          # sign-in goes through the helper
-    did = []
-
-    async def fake_async(cmd, timeout=5, check=False):
-        did.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0)
-
-    async def fake_kill():
-        did.append("kill")
-
-    async def primary():
-        return "%7"
-
-    async def no_claude(pane):
-        return False
-
-    async def fast_sleep(_s):
-        return None
-
-    monkeypatch.setattr(mod, "_run_subprocess_async", fake_async)
-    monkeypatch.setattr(mod, "_kill_claude_process", fake_kill)
-    monkeypatch.setattr(mod, "_find_primary_pane_async", primary)
-    monkeypatch.setattr(mod, "_is_claude_running_async", no_claude)
-    monkeypatch.setattr(mod.asyncio, "sleep", fast_sleep)
-    r = TestClient(mod.app).post("/api/evolution/first-boot", headers=H).json()
-    assert r["status"] == "fired" and mod.FIRST_BOOT_MARKER.exists() and "kill" in did
 
 
 def _helper_pane_fn(mod, pane_pid, dead=False):
@@ -413,6 +363,10 @@ def test_guard_also_covers_clear_history_and_resize(portal):
     assert ps._is_send_keys(["tmux", "resize-window", "-t", "%1", "-x", "500"])
     assert ps._is_send_keys(["tmux", "send-keys", "-t", "%1", "x"])
     assert not ps._is_send_keys(["tmux", "capture-pane", "-p", "-t", "%1"])
+    assert ps._is_send_keys(["tmux", "-L", "portal-signin", "send-keys", "-t", "%1", "x"])
+    assert ps._is_send_keys(["tmux", "-S", "/x/sock", "resize-window", "-t", "%1"])
+    assert not ps._is_send_keys(["tmux", "-L", "send-keys", "list-panes"])   # socket named send-keys
+    assert not ps._is_send_keys(["tmux", "capture-pane", "-t", "send-keys"])
 
 
 def test_newborn_start_closes_a_leftover_helper_first(portal, monkeypatch):
@@ -434,3 +388,249 @@ def test_newborn_start_closes_a_leftover_helper_first(portal, monkeypatch):
     monkeypatch.setattr(mod, "_find_primary_pane_async", primary)
     assert TestClient(mod.app).post("/api/auth/start", headers=H).json() == {"started": True}
     assert order == [("close", "newborn sign-in"), ("flow", "%7")]
+
+
+# ---------------------------------------------------------------- round 3 (t3383)
+
+def _fb_fakes(mod, monkeypatch, did):
+    async def fake_async(cmd, timeout=5, check=False):
+        if mod._newborn_flow_guard.get() and mod._is_send_keys(cmd):
+            await mod._newborn_guard_check("key")
+        did.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    async def fake_kill(pane=None):
+        if mod._newborn_flow_guard.get():
+            await mod._newborn_guard_check("kill")
+        did.append("kill")
+
+    async def primary():
+        return "%7"
+
+    async def no_claude(pane):
+        return False
+
+    async def fast_sleep(_s):
+        return None
+
+    async def no_adopt(pane, tail):
+        did.append(("adopt", tail))
+
+    monkeypatch.setattr(mod, "_run_subprocess_async", fake_async)
+    monkeypatch.setattr(mod, "_kill_claude_process", fake_kill)
+    monkeypatch.setattr(mod, "_find_primary_pane_async", primary)
+    monkeypatch.setattr(mod, "_is_claude_running_async", no_claude)
+    monkeypatch.setattr(mod, "_adopt_newborn_launch", no_adopt)
+    monkeypatch.setattr(mod.asyncio, "sleep", fast_sleep)
+
+
+def test_first_boot_refuses_when_any_working_ai_runs(portal, monkeypatch):
+    """Item 1: no marker and no transcript, but a working AI process runs
+    (a stray, or an AI whose turns cannot be found): never kill it."""
+    mod, home, calls = portal
+    did = []
+    _fb_fakes(mod, monkeypatch, did)
+    monkeypatch.setattr(mod, "_claude_processes_sync", lambda: [4242])
+    monkeypatch.setattr(mod, "_proc_argv", lambda pid: ["claude", "--dangerously-skip-permissions"])
+    c = TestClient(mod.app)
+    assert c.post("/api/evolution/first-boot", headers=H).json() == {"status": "skipped_ai_running"}
+    monkeypatch.setattr(mod, "_claude_processes_sync", lambda: None)      # cannot tell = refuse
+    assert c.post("/api/evolution/first-boot", headers=H).json() == {"status": "skipped_ai_running"}
+    assert did == [] and not mod.FIRST_BOOT_MARKER.exists()
+
+
+def test_first_boot_fires_when_the_only_claude_is_the_flows_own(portal, monkeypatch):
+    """The newborn path: the sign-in Claude the first sign-in launched (now signed
+    in) is the flow's own, so main's awakening still runs; the guard re-checks
+    every key and kill."""
+    mod, home, calls = portal
+    did = []
+    _fb_fakes(mod, monkeypatch, did)
+    (home / ".claude" / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": "a", "expiresAt": int(time.time() * 1000) + 3600_000}}))
+    monkeypatch.setattr(mod, "_claude_processes_sync", lambda: [4242])
+    monkeypatch.setattr(mod, "_proc_argv", lambda pid: ["claude", "/login"])
+    assert mod._foreign_ai_sync() == [4242]                              # not adopted: foreign
+    monkeypatch.setattr(mod, "_newborn_own_pids_sync", lambda: {4242})
+    r = TestClient(mod.app).post("/api/evolution/first-boot", headers=H).json()
+    assert r["status"] == "fired" and mod.FIRST_BOOT_MARKER.exists()
+    assert did[0] == "kill" and ("adopt", "--dangerously-skip-permissions") in did
+    assert any(isinstance(x, list) and "--dangerously-skip-permissions" in " ".join(x) for x in did)
+
+
+def test_first_boot_stops_at_the_next_key_when_an_ai_appears(portal, monkeypatch):
+    mod, home, calls = portal
+    did = []
+    _fb_fakes(mod, monkeypatch, did)
+    state = {"n": 0}
+
+    def procs():
+        state["n"] += 1
+        return [] if state["n"] <= 2 else [4242]     # AI appears after the kill
+    monkeypatch.setattr(mod, "_claude_processes_sync", procs)
+    monkeypatch.setattr(mod, "_proc_argv", lambda pid: ["claude"])
+    r = TestClient(mod.app).post("/api/evolution/first-boot", headers=H).json()
+    assert r == {"status": "stopped_ai_running"}
+    assert did == ["kill"], did                      # no key reached the pane
+    assert not mod.FIRST_BOOT_MARKER.exists()        # a stopped first boot can re-check later
+
+
+def test_own_claude_is_adopted_only_as_a_child_of_the_pane_shell(portal):
+    mod, home, calls = portal
+    py = 'exec -a claude python3 -c "import time; time.sleep(30)"'
+    # the /login Claude runs under a wrapper shell, not as a direct child (review r3 #3)
+    shell = subprocess.Popen(["bash", "-c", f"(bash -c '{py} /login; true') & ({py} --other) & wait"])
+    other = subprocess.Popen(["bash", "-c", f"{py} /login"])
+    try:
+        time.sleep(0.5)
+        since = mod._boot_ticks_now() - 10 * os.sysconf("SC_CLK_TCK")
+        kids = mod._adopt_children_sync(shell.pid, "/login", since)
+        assert len(kids) == 1 and other.pid not in kids
+        assert mod._proc_argv(kids[0])[-1] == "/login"
+        assert set(kids) <= mod._newborn_own_pids_sync()
+        mod._newborn_own.clear()
+        assert mod._adopt_children_sync(shell.pid, "/login", mod._boot_ticks_now() + 1000) == []
+    finally:
+        for pid in sorted(mod._descendants_sync(shell.pid) | {other.pid}, reverse=True):
+            try:
+                _REAL_KILL(pid, 9)
+            except ProcessLookupError:
+                pass
+        shell.wait()
+        other.wait()
+
+
+def test_kill_is_scoped_to_the_primary_pane_tree(portal, monkeypatch):
+    """Item 4: no container-wide pkill; only Claude processes under the pane."""
+    mod, home, calls = portal
+    pane_shell = subprocess.Popen(["bash", "-c", "(exec -a claude sleep 30) & (exec -a sleep sleep 30) & wait"])
+    outside = subprocess.Popen(["bash", "-c", "exec -a claude sleep 30"])
+    killed = []
+    try:
+        time.sleep(0.4)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: (killed.append((pid, sig)), _REAL_KILL(pid, sig)))
+        k = mod._kill_claude_in_tree_sync(pane_shell.pid)
+        assert len(k) == 1 and outside.poll() is None and pane_shell.poll() is None
+        assert [s for _, s in killed] == [15]
+        assert mod._proc_argv(outside.pid)[0] == "claude"
+    finally:
+        for pid in sorted(mod._descendants_sync(pane_shell.pid) | {outside.pid}, reverse=True):
+            try:
+                _REAL_KILL(pid, 9)
+            except ProcessLookupError:
+                pass
+        pane_shell.wait()
+        outside.wait()
+
+
+def test_kill_claude_process_has_no_pkill():
+    import inspect
+    sys.modules.pop("portal_server", None)
+    import portal_server as ps
+    assert "pkill" not in inspect.getsource(ps._kill_claude_process)
+    assert "pkill" not in inspect.getsource(ps._kill_claude_in_tree_sync)
+
+
+def test_is_claude_running_reads_the_pane_command(portal, monkeypatch):
+    """Item 4: main read .stdout of a call that discards stdout (always False)."""
+    mod, home, calls = portal
+    outs = {"%1": "claude\n", "%2": "node\n", "%3": "bash\n", "%4": ""}
+
+    async def fake_out(cmd, timeout=5):
+        return outs[cmd[cmd.index("-t") + 1]]
+    monkeypatch.setattr(mod, "_run_subprocess_output", fake_out)
+    got = [asyncio.run(mod._is_claude_running_async(p)) for p in ("%1", "%2", "%3", "%4")]
+    assert got == [True, True, False, False]
+
+
+def test_helper_commands_use_the_helpers_own_tmux_server():
+    """Item 2: every helper tmux command carries -L portal-signin; the AI's
+    session resolver has no helper special case."""
+    import inspect
+    sys.modules.pop("portal_server", None)
+    import portal_server as ps
+    assert ps._HELPER_TMUX == ["tmux", "-L", "portal-signin"]
+    for fn in (ps._signin_helper_pane, ps._signin_helper_send, ps._close_signin_helper,
+               ps._run_signin_helper, ps._signin_helper_submit_code):
+        src = inspect.getsource(fn)
+        assert '["tmux"' not in src and "_find_primary_pane" not in src or fn is ps._close_signin_helper, fn.__name__
+    assert "SIGNIN_HELPER" not in inspect.getsource(ps.get_tmux_session)
+
+
+def _submit_fakes(mod, monkeypatch, frames, write_at=None, exit_at=None):
+    """frames: list of screen texts per poll; creds rewritten at poll write_at;
+    helper pane gone from poll exit_at."""
+    n = {"poll": 0, "closed": None}
+    home_creds = mod.CREDENTIALS_FILE
+
+    async def pane():
+        if exit_at is not None and n["poll"] >= exit_at:
+            return None
+        return {"pane_id": "%1", "pane_pid": 1, "dead": False}
+
+    async def send(*a, **k):
+        return None
+
+    async def screen(p, tmux_cmd=("tmux",)):
+        return "unknown", frames[min(n["poll"], len(frames) - 1)]
+
+    async def tick(_s):
+        n["poll"] += 1
+        if write_at is not None and n["poll"] == write_at:
+            home_creds.write_text(json.dumps({"claudeAiOauth": {
+                "accessToken": "new", "expiresAt": int(time.time() * 1000) + 3600_000}}))
+
+    async def close(reason):
+        n["closed"] = (n["poll"], reason)
+        return True
+    monkeypatch.setattr(mod, "_signin_helper_pane", pane)
+    monkeypatch.setattr(mod, "_signin_helper_send", send)
+    monkeypatch.setattr(mod, "_detect_auth_screen", screen)
+    monkeypatch.setattr(mod.asyncio, "sleep", tick)
+    monkeypatch.setattr(mod, "_close_signin_helper", close)
+    return n
+
+
+def test_submit_waits_for_the_credentials_after_login_successful(portal, monkeypatch):
+    """Item 3: 'Login successful' shows before the file is written: keep waiting,
+    never close the helper before the rewrite; then signed in."""
+    mod, home, calls = portal
+    _expired(home)
+    n = _submit_fakes(mod, monkeypatch, ["Paste code", "Login successful. Press Enter"], write_at=12)
+    r = asyncio.run(mod._signin_helper_submit_code("c#s"))
+    assert r["result"] == "signed_in" and n["closed"][1] == "signed in" and n["closed"][0] >= 12
+
+
+def test_submit_ignores_a_rewrite_before_the_helper_finished(portal, monkeypatch):
+    """Review r3 #9a: the AI's own token refresh while the helper still waits on
+    the code is not this sign-in."""
+    mod, home, calls = portal
+    _expired(home)
+    n = _submit_fakes(mod, monkeypatch, ["Paste code"], write_at=2)       # helper never says done
+    r = asyncio.run(mod._signin_helper_submit_code("c#s"))
+    assert r["result"] == "pending" and n["closed"] is None
+
+
+def test_submit_write_then_exit_is_signed_in(portal, monkeypatch):
+    """Review r3 #9b: the helper writes and exits in the same poll: signed in."""
+    mod, home, calls = portal
+    _expired(home)
+    n = _submit_fakes(mod, monkeypatch, ["Paste code"], write_at=5, exit_at=5)
+    r = asyncio.run(mod._signin_helper_submit_code("c#s"))
+    assert r["result"] == "signed_in"
+
+
+def test_submit_fails_only_after_a_bounded_wait(portal, monkeypatch):
+    mod, home, calls = portal
+    _expired(home)
+    n = _submit_fakes(mod, monkeypatch, ["Login successful. Press Enter"])     # never writes
+    r = asyncio.run(mod._signin_helper_submit_code("c#s"))
+    assert r["result"] == "failed" and n["closed"][1] == "sign-in failed" and n["closed"][0] >= 30
+    _expired(home)
+    n = _submit_fakes(mod, monkeypatch, ["Paste code"], exit_at=3)            # helper exited, no file
+    r = asyncio.run(mod._signin_helper_submit_code("c#s"))
+    assert r["result"] == "failed"
+    _expired(home)
+    n = _submit_fakes(mod, monkeypatch, ["Paste code"])                        # still exchanging
+    r = asyncio.run(mod._signin_helper_submit_code("c#s"))
+    assert r["result"] == "pending" and n["closed"] is None
