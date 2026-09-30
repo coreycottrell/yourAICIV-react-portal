@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import type { ReactNode } from 'react'
 import { apiGet, apiPost } from '../../api/client'
 import { fireFirstBoot } from '../../api/evolution'
 import { SUPPORT_URL, SUPPORT_LABEL } from '../../utils/brand'
 import { CLAUDE_AUTH_STATUS_EVENT } from './claudeAuthStatus'
-import type { ClaudeAuthStatus } from './claudeAuthStatus'
+import type { ClaudeAuthStatus, ReconnectResponse } from './claudeAuthStatus'
 import './ClaudeAuthFlow.css'
 
 type AuthStatusResponse = ClaudeAuthStatus
@@ -45,6 +46,7 @@ export function ClaudeAuthFlow() {
   const [authenticated, setAuthenticated] = useState(false)
   const [liveReason, setLiveReason] = useState<string | undefined>(undefined)
   const [noteDismissed, setNoteDismissed] = useState(false)
+  const [heldNote, setHeldNote] = useState(false)
   const stepRef = useRef<FlowStep>('checking')
   useEffect(() => { stepRef.current = step }, [step])
 
@@ -93,11 +95,13 @@ export function ClaudeAuthFlow() {
   // Status handed over by the Reconnect Claude button.
   useEffect(() => {
     const onStatus = (e: Event) => {
-      const res = (e as CustomEvent<AuthStatusResponse>).detail
+      const res = (e as CustomEvent<ReconnectResponse>).detail
       if (!res || typeof res.authenticated !== 'boolean') return
       if (IN_FLOW_STEPS.includes(stepRef.current)) return
       setError(null)
       setNoteDismissed(false)
+      // Reconnect was held: the AI is running, nothing was signed out.
+      setHeldNote(res.reconnect?.held === 'live_session')
       if (res.authenticated) {
         setAuthenticated(true)
         return
@@ -190,37 +194,28 @@ export function ClaudeAuthFlow() {
 
   // triggerEvolution removed — fire-and-forget in submitCode, dismiss immediately
 
+  if (heldNote) {
+    return (
+      <LiveSessionNote onClose={() => setHeldNote(false)}>
+        Your AI is running right now, so Reconnect did not sign it out, because that could
+        stop what it is doing.
+      </LiveSessionNote>
+    )
+  }
+
   // Render nothing if authenticated or skipped
   if (authenticated) return null
   if (step === 'checking') return null
 
   if (step === 'live-note') {
     if (noteDismissed) return null
-    const signedOut = liveReason === 'no_credentials'
     return (
-      <div className="claude-auth-overlay" role="dialog" aria-modal="true" aria-labelledby="claude-live-note-title">
-        <div className="claude-auth-box claude-live-note">
-          <div className="claude-auth-title" id="claude-live-note-title">Claude sign-in</div>
-          <div className="claude-auth-desc">
-            {signedOut
-              ? 'Claude has been signed out on your AI, but your AI is still running.'
-              : "Your AI's Claude sign-in has expired or could not be confirmed, but your AI is still running."}
-            {' '}The portal won't start a new sign-in while it runs, because that would interrupt it.
-          </div>
-          <div className="claude-auth-note">
-            If your AI is answering you normally, you can close this note. If it isn't,
-            contact support and we'll reconnect it for you.
-          </div>
-          {SUPPORT_URL && (
-            <a className="claude-auth-link-inline" href={SUPPORT_URL} target="_blank" rel="noopener noreferrer">
-              {SUPPORT_LABEL}
-            </a>
-          )}
-          <button className="claude-auth-btn" onClick={() => setNoteDismissed(true)} autoFocus>
-            Close
-          </button>
-        </div>
-      </div>
+      <LiveSessionNote onClose={() => setNoteDismissed(true)}>
+        {liveReason === 'no_credentials'
+          ? 'Claude has been signed out on your AI, but your AI is still running.'
+          : "Your AI's Claude sign-in has expired or could not be confirmed, but your AI is still running."}
+        {' '}The portal won't start a new sign-in while it runs, because that would interrupt it.
+      </LiveSessionNote>
     )
   }
 
@@ -308,6 +303,30 @@ export function ClaudeAuthFlow() {
 
           </>
         )}
+      </div>
+    </div>
+  )
+}
+
+/** Plain, closable note shown instead of the sign-in flow while the AI runs. */
+function LiveSessionNote({ children, onClose }: { children: ReactNode; onClose: () => void }) {
+  return (
+    <div className="claude-auth-overlay" role="dialog" aria-modal="true" aria-labelledby="claude-live-note-title">
+      <div className="claude-auth-box claude-live-note">
+        <div className="claude-auth-title" id="claude-live-note-title">Claude sign-in</div>
+        <div className="claude-auth-desc">{children}</div>
+        <div className="claude-auth-note">
+          If your AI is answering you normally, you can close this note. If it isn't,
+          contact support and we'll reconnect it for you.
+        </div>
+        {SUPPORT_URL && (
+          <a className="claude-auth-link-inline" href={SUPPORT_URL} target="_blank" rel="noopener noreferrer">
+            {SUPPORT_LABEL}
+          </a>
+        )}
+        <button className="claude-auth-btn" onClick={onClose} autoFocus>
+          Close
+        </button>
       </div>
     </div>
   )

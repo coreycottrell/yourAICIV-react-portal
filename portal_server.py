@@ -2197,22 +2197,45 @@ def _argv_is_claude(argv: list) -> bool:
     return False
 
 
-def _primary_session_runs_claude_sync() -> bool | None:
-    """Is a Claude process running in the primary tmux session? Read only:
-    tmux has-session / list-panes and /proc. None = could not tell."""
-    session = get_tmux_session()
+_SIGNIN_INSTANCE_MAX_AGE_S = 20 * 60
+
+
+def _process_age_s(pid: int) -> float | None:
     try:
-        r = subprocess.run(["tmux", "has-session", "-t", session],
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        start_ticks = int(stat[stat.rindex(")") + 2:].split()[19])
+        uptime = float(Path("/proc/uptime").read_text().split()[0])
+        return uptime - start_ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _is_signin_instance(pid: int, argv: list) -> bool:
+    """A `claude /login` the sign-in flow started, still within its sign-in
+    window. An older one has become the working AI (after a sign-in with no
+    first boot), so it counts as live again."""
+    if "/login" not in argv[1:]:
+        return False
+    age = _process_age_s(pid)
+    return age is not None and age < _SIGNIN_INSTANCE_MAX_AGE_S
+
+
+def _tmux_runs_live_claude_sync() -> bool | None:
+    """Is a working Claude (not a `claude /login` sign-in instance) running in
+    ANY pane of this user's tmux server? Read only: `tmux list-panes -a` and
+    /proc. All panes, not just the primary one, because the old sign-in
+    flow's retry stops every Claude process. None = could not tell."""
+    try:
+        r = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_pid}"],
                            capture_output=True, text=True, timeout=3)
         if r.returncode != 0:
-            return False
-        r = subprocess.run(["tmux", "list-panes", "-s", "-t", session, "-F", "#{pane_pid}"],
-                           capture_output=True, text=True, timeout=3)
-        if r.returncode != 0:
+            err = (r.stderr or "").lower()
+            if "no server running" in err or "error connecting" in err:
+                return False  # no tmux server: nothing runs in a pane
             return None
         roots = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
         if not roots:
-            return None
+            return False
         children: dict = {}
         for d in Path("/proc").iterdir():
             if not d.name.isdigit():
@@ -2235,12 +2258,26 @@ def _primary_session_runs_claude_sync() -> bool | None:
                 argv = [a.decode("utf-8", "replace") for a in argv if a]
             except OSError:
                 argv = []
-            if _argv_is_claude(argv):
+            if _argv_is_claude(argv) and not _is_signin_instance(pid, argv):
                 return True
             stack.extend(children.get(pid, []))
         return False
     except Exception:
         return None
+
+
+async def _established_ai_running() -> bool:
+    """True when this CIV is established and a working Claude runs in tmux
+    (or that cannot be told). Always False for a newborn."""
+    if not _civ_is_established():
+        return False
+    loop = asyncio.get_event_loop()
+    running = await loop.run_in_executor(None, _tmux_runs_live_claude_sync)
+    return running is not False
+
+
+_LIVE_AI_MSG = ("Your AI is running right now, so the portal will not start a sign-in here, "
+                "because that would interrupt it. Contact support and we'll reconnect it for you.")
 
 
 def _civ_is_established() -> bool:
@@ -2297,12 +2334,7 @@ async def _claude_auth_status_payload() -> dict:
     # CIV, so the page can show a plain note instead of a sign-in flow that
     # would type into that session. A newborn never gets this flag.
     try:
-        established = _civ_is_established()
-        running = None
-        if established:
-            loop = asyncio.get_event_loop()
-            running = await loop.run_in_executor(None, _primary_session_runs_claude_sync)
-        payload["live_session"] = bool(established and running is not False)
+        payload["live_session"] = await _established_ai_running()
     except Exception:
         payload["live_session"] = False
     return payload
@@ -2319,13 +2351,21 @@ async def api_claude_auth_reconnect(request: Request) -> JSONResponse:
     """Reconnect Claude: move ~/.claude/.credentials.json to a timestamped
     .bak next to it (nothing deleted, memory untouched) and return the new
     status. No keys are typed and no process is touched; the page then
-    shows the normal sign-in dialog, or a plain note if the AI is running."""
+    shows the normal sign-in dialog.
+
+    Held (nothing moved) while an established CIV's AI is running in its
+    session: signing it out could stop what it is doing, and the portal's
+    sign-in flow would type into that session. The page shows a plain note."""
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     if request.method != "POST":
         return JSONResponse({"error": "method not allowed"}, status_code=405)
     if _engine_is_managed():
         return JSONResponse({"error": "managed", "managed": True}, status_code=409)
+    if await _established_ai_running():
+        status = await _claude_auth_status_payload()
+        return JSONResponse({**status, "live_session": True,
+                             "reconnect": {"moved": False, "backup": None, "held": "live_session"}})
     backup = None
     try:
         if CREDENTIALS_FILE.exists() or CREDENTIALS_FILE.is_symlink():
@@ -2356,6 +2396,10 @@ async def api_claude_auth_start(request: Request) -> JSONResponse:
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     global _captured_oauth_url
+    if await _established_ai_running():
+        # t3383: the sign-in flow below types into the pane and, on retry,
+        # stops every Claude process. Never run it over a working AI.
+        return JSONResponse({"started": False, "live_session": True, "error": _LIVE_AI_MSG})
     _captured_oauth_url = None
     pane = await _find_primary_pane_async()
     _save_portal_message(f"Auth flow v2 started — {get_tmux_session()} (pane {pane})", role="assistant")
@@ -2377,6 +2421,10 @@ async def api_claude_auth_prewarm(request: Request) -> JSONResponse:
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     global _auth_prewarm_task
+    if await _established_ai_running():
+        # t3383: the sign-in flow below types into the pane and, on retry,
+        # stops every Claude process. Never run it over a working AI.
+        return JSONResponse({"started": False, "live_session": True, "error": _LIVE_AI_MSG})
     # Don't start if already prewarming
     if _auth_prewarm_task and not _auth_prewarm_task.done():
         return JSONResponse({"status": "already_prewarming"})

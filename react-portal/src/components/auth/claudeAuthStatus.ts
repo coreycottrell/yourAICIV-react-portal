@@ -12,7 +12,8 @@ export interface ClaudeAuthStatus {
 }
 
 export interface ReconnectResponse extends ClaudeAuthStatus {
-  reconnect?: { moved: boolean; backup: string | null }
+  /** held = nothing was moved because the AI is running in its session. */
+  reconnect?: { moved: boolean; backup: string | null; held?: string }
   error?: string
 }
 

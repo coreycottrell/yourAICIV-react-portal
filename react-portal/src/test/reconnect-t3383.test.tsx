@@ -127,4 +127,17 @@ describe('ReconnectClaudeButton (t3383)', () => {
     expect(await screen.findByText('Authenticate Now')).toBeInTheDocument()
     expect(startCalls()).toHaveLength(0)
   })
+
+  it('reconnect held while the AI runs: plain note even though still signed in, nothing started', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    reconnectBody = { authenticated: true, reason: 'token_valid', live_session: true,
+      reconnect: { moved: false, backup: null, held: 'live_session' } }
+    render(<><ReconnectClaudeButton /><ClaudeAuthFlow /></>)
+    fireEvent.click(await screen.findByText('Reconnect Claude'))
+    expect(await screen.findByText(/Reconnect did not sign it out/)).toBeInTheDocument()
+    expect(screen.queryByText('Authenticate Now')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByText('Close'))
+    await waitFor(() => expect(screen.queryByText(/Reconnect did not sign it out/)).not.toBeInTheDocument())
+    expect(startCalls()).toHaveLength(0)
+  })
 })

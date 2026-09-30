@@ -49,7 +49,7 @@ def portal(tmp_path, monkeypatch):
             raise AssertionError(f"auth status/reconnect must not type or kill: {flat}")
         if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "tmux":
             # Never reach a real tmux server from tests: pretend no session.
-            return subprocess.CompletedProcess(cmd, 1, "", "no server")
+            return subprocess.CompletedProcess(cmd, 1, "", "no server running on /tmp/tmux-test/default")
         return real_run(cmd, *a, **kw)
 
     monkeypatch.setattr(mod.subprocess, "run", guarded_run)
@@ -233,7 +233,7 @@ def test_large_transcript_only_tail_is_read(portal):
 
 def test_newborn_never_flagged_live(portal, monkeypatch):
     mod, home, _ = portal
-    monkeypatch.setattr(mod, "_primary_session_runs_claude_sync", lambda: True)
+    monkeypatch.setattr(mod, "_tmux_runs_live_claude_sync", lambda: True)
     s = _status(mod)
     assert s["authenticated"] is False and s["live_session"] is False
 
@@ -241,17 +241,18 @@ def test_newborn_never_flagged_live(portal, monkeypatch):
 def test_established_civ_with_claude_running_flagged_live(portal, monkeypatch):
     mod, home, _ = portal
     mod.FIRST_BOOT_MARKER.write_text("1")
-    monkeypatch.setattr(mod, "_primary_session_runs_claude_sync", lambda: True)
+    monkeypatch.setattr(mod, "_tmux_runs_live_claude_sync", lambda: True)
     assert _status(mod)["live_session"] is True
-    monkeypatch.setattr(mod, "_primary_session_runs_claude_sync", lambda: None)
+    monkeypatch.setattr(mod, "_tmux_runs_live_claude_sync", lambda: None)
     assert _status(mod)["live_session"] is True  # cannot tell -> treat as live
-    monkeypatch.setattr(mod, "_primary_session_runs_claude_sync", lambda: False)
+    monkeypatch.setattr(mod, "_tmux_runs_live_claude_sync", lambda: False)
     assert _status(mod)["live_session"] is False
 
 
 def test_session_detection_reads_only(portal, monkeypatch):
-    """Real detection against a real private tmux server: finds a process whose
-    argv[0] is 'claude' in the pane tree, and never types into the pane."""
+    """Real detection against a real PRIVATE tmux server: finds a process whose
+    argv[0] is 'claude' in any pane, ignores a young `claude /login` sign-in
+    instance, and never types into a pane."""
     mod, home, typed = portal
     import shutil
     if not shutil.which("tmux"):
@@ -267,19 +268,25 @@ def test_session_detection_reads_only(portal, monkeypatch):
         return _REAL_RUN(cmd, *a, **kw)
 
     monkeypatch.setattr(mod.subprocess, "run", run_private)
-    monkeypatch.setattr(mod, "get_tmux_session", lambda: "sbx-primary")
     env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
+    assert mod._tmux_runs_live_claude_sync() is False  # no server at all
     _REAL_RUN(["tmux", "-S", sock, "new-session", "-d", "-s", "sbx-primary", "bash --norc --noprofile"], env=env, check=True)
     try:
-        assert mod._primary_session_runs_claude_sync() is False
+        assert mod._tmux_runs_live_claude_sync() is False
         _REAL_RUN(["tmux", "-S", sock, "new-window", "-t", "sbx-primary",
+                   "exec -a claude python3 -c 'import time; time.sleep(30)' /login"], env=env, check=True)
+        time.sleep(0.5)
+        assert mod._tmux_runs_live_claude_sync() is False  # young sign-in instance
+        monkeypatch.setattr(mod, "_SIGNIN_INSTANCE_MAX_AGE_S", 0)
+        assert mod._tmux_runs_live_claude_sync() is True   # an old /login instance is the AI now
+        monkeypatch.setattr(mod, "_SIGNIN_INSTANCE_MAX_AGE_S", 1200)
+        # a working AI in another session (not the attached/primary one)
+        _REAL_RUN(["tmux", "-S", sock, "new-session", "-d", "-s", "teammate",
                    "exec -a claude sleep 30"], env=env, check=True)
         time.sleep(0.5)
-        assert mod._primary_session_runs_claude_sync() is True
+        assert mod._tmux_runs_live_claude_sync() is True
     finally:
         _REAL_RUN(["tmux", "-S", sock, "kill-server"], env=env)
-    monkeypatch.setattr(mod, "get_tmux_session", lambda: "no-such-session")
-    assert mod._primary_session_runs_claude_sync() is False
     assert typed == []
 
 
@@ -348,7 +355,71 @@ def test_new_code_has_no_key_or_kill_paths():
     sys.modules.pop("portal_server", None)
     import portal_server as ps
     for fn in (ps._claude_auth_status_payload, ps.api_claude_auth_status, ps.api_claude_auth_reconnect,
-               ps._primary_session_runs_claude_sync, ps._primary_turn_after, ps._file_turn_after):
+               ps._tmux_runs_live_claude_sync, ps._primary_turn_after, ps._file_turn_after,
+               ps._established_ai_running, ps._is_signin_instance):
         src = inspect.getsource(fn)
         for bad in ("send-keys", "pkill", "os.kill", "_kill_claude_process", "signal.", "restart"):
             assert bad not in src, (fn.__name__, bad)
+
+
+def test_reconnect_held_while_established_ai_runs(portal, monkeypatch):
+    """Established CIV with its AI running (or unknown): nothing is moved."""
+    mod, home, typed = portal
+    mod.FIRST_BOOT_MARKER.write_text("1")
+    _creds(home, accessToken="a", refreshToken="r", expiresAt=_now_ms() + 3600_000)
+    original = (home / ".claude" / ".credentials.json").read_text()
+    c = TestClient(mod.app)
+    for running in (True, None):
+        monkeypatch.setattr(mod, "_tmux_runs_live_claude_sync", lambda r=running: r)
+        body = c.post("/api/auth/reconnect", headers=H).json()
+        assert body["reconnect"] == {"moved": False, "backup": None, "held": "live_session"}
+        assert body["live_session"] is True
+        assert body["authenticated"] is True  # still signed in: nothing touched
+        assert (home / ".claude" / ".credentials.json").read_text() == original
+        assert not [f for f in (home / ".claude").iterdir() if ".bak-" in f.name]
+    assert typed == []
+
+
+def test_reconnect_moves_for_newborn_even_if_claude_runs(portal, monkeypatch):
+    """A newborn mid-sign-in (claude /login in the pane) is not an established AI."""
+    mod, home, _ = portal
+    _creds(home, accessToken="a")
+    monkeypatch.setattr(mod, "_tmux_runs_live_claude_sync", lambda: True)
+    body = TestClient(mod.app).post("/api/auth/reconnect", headers=H).json()
+    assert body["reconnect"]["moved"] is True
+
+
+def test_signin_flow_refuses_over_a_working_ai(portal, monkeypatch):
+    """Server-side guard: /api/auth/start and /prewarm never touch the pane of
+    an established CIV while its AI runs; a newborn is unaffected."""
+    mod, home, typed = portal
+    touched = []
+
+    async def fake_async(cmd, timeout=5, check=False):
+        touched.append(cmd)
+        raise AssertionError(f"touched tmux: {cmd}")
+    monkeypatch.setattr(mod, "_run_subprocess_async", fake_async)
+    mod.FIRST_BOOT_MARKER.write_text("1")
+    monkeypatch.setattr(mod, "_tmux_runs_live_claude_sync", lambda: True)
+    c = TestClient(mod.app)
+    for path in ("/api/auth/start", "/api/auth/prewarm"):
+        body = c.post(path, headers=H).json()
+        assert body["started"] is False and body["live_session"] is True and "running" in body["error"]
+    assert touched == [] and typed == []
+
+
+def test_signin_flow_unchanged_for_newborn(portal, monkeypatch):
+    mod, home, _ = portal
+    monkeypatch.setattr(mod, "_tmux_runs_live_claude_sync", lambda: True)
+    called = []
+
+    async def fake_machine(pane):
+        called.append(pane)
+        return {"started": True, "url": "https://claude.ai/oauth/authorize?state=x"}
+    monkeypatch.setattr(mod, "_run_auth_state_machine", fake_machine)
+
+    async def pane():
+        return "%0"
+    monkeypatch.setattr(mod, "_find_primary_pane_async", pane)
+    body = TestClient(mod.app).post("/api/auth/start", headers=H).json()
+    assert body["started"] is True and called == ["%0"]
