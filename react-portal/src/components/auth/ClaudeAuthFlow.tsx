@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { apiGet, apiPost } from '../../api/client'
 import { fireFirstBoot } from '../../api/evolution'
+import { SUPPORT_URL, SUPPORT_LABEL } from '../../utils/brand'
 import './ClaudeAuthFlow.css'
 
 interface AuthStatusResponse {
@@ -8,6 +9,10 @@ interface AuthStatusResponse {
   account?: string | null
   expires_at?: number | null
   subscription?: string | null
+  /** Why the server answered as it did (e.g. "token_valid", "expired_no_activity_since"). */
+  reason?: string
+  /** Signed out, but an established AI is running right now. */
+  live_session?: boolean
 }
 
 interface StartResponse {
@@ -34,6 +39,7 @@ type FlowStep =
   | 'submitting-code'
   | 'verifying'
   | 'success'
+  | 'live-note'
 
 export function ClaudeAuthFlow() {
   const [step, setStep] = useState<FlowStep>('checking')
@@ -41,6 +47,7 @@ export function ClaudeAuthFlow() {
   const [code, setCode] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [authenticated, setAuthenticated] = useState(false)
+  const [noteClosed, setNoteClosed] = useState(false)
 
   const urlPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const statusPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -69,6 +76,10 @@ export function ClaudeAuthFlow() {
         if (cancelled) return
         if (res.authenticated) {
           setAuthenticated(true)
+        } else if (res.live_session) {
+          // An established AI is running: the sign-in flow would type into
+          // it, so show a plain, closable note instead.
+          setStep('live-note')
         } else {
           setStep('idle')
         }
@@ -158,6 +169,34 @@ export function ClaudeAuthFlow() {
   // Render nothing if authenticated or skipped
   if (authenticated) return null
   if (step === 'checking') return null
+
+  if (step === 'live-note') {
+    if (noteClosed) return null
+    return (
+      <div className="claude-auth-overlay" role="dialog" aria-modal="true" aria-labelledby="claude-live-note-title">
+        <div className="claude-auth-box claude-live-note">
+          <div className="claude-auth-title" id="claude-live-note-title">Claude sign-in</div>
+          <div className="claude-auth-desc">
+            Your AI's Claude sign-in has expired or could not be confirmed, but your AI is still
+            running. The portal won't start a new sign-in while it runs, because that would
+            interrupt it.
+          </div>
+          <div className="claude-auth-note">
+            If your AI is answering you normally, you can close this note. If it isn't,
+            contact support and we'll reconnect it for you.
+          </div>
+          {SUPPORT_URL && (
+            <a className="claude-auth-link-inline" href={SUPPORT_URL} target="_blank" rel="noopener noreferrer">
+              {SUPPORT_LABEL}
+            </a>
+          )}
+          <button className="claude-auth-btn" onClick={() => setNoteClosed(true)} autoFocus>
+            Close
+          </button>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="claude-auth-overlay">

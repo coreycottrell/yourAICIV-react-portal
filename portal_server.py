@@ -2071,38 +2071,258 @@ def _engine_is_managed() -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Claude sign-in status (t3383). Everything in this block only READS: files
+# under ~/.claude, /proc, and `tmux has-session` / `tmux list-panes`. It never
+# sends a key to tmux and never signals a process.
+# ---------------------------------------------------------------------------
+
+_AUTH_SCAN_WINDOWS = (256 * 1024, 2 * 1024 * 1024, 8 * 1024 * 1024)
+_AUTH_SCAN_MAX_FILES = 5
+_auth_turn_cache: dict = {}
+
+
+def _primary_project_dir() -> Path:
+    """The Claude project dir of the primary session, which runs from $HOME.
+    Claude names a project dir after its path with every non-alphanumeric
+    character turned into '-': /home/aiciv -> -home-aiciv. Headless and tool
+    sessions run from other folders land in other dirs and are never read."""
+    return _PROJECTS_DIR / re.sub(r"[^A-Za-z0-9]", "-", str(Path.home()))
+
+
+def _iso_to_ms(ts):
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _is_real_primary_turn(entry: dict) -> bool:
+    """A reply the model actually produced in the interactive primary session.
+    Not: API error placeholders, synthetic messages, sidechain (subagent)
+    turns, or turns from a headless run (entrypoint sdk-*)."""
+    if entry.get("type") != "assistant":
+        return False
+    if entry.get("isSidechain") or entry.get("isApiErrorMessage"):
+        return False
+    entrypoint = entry.get("entrypoint")
+    if entrypoint is not None and entrypoint != "cli":
+        return False
+    msg = entry.get("message")
+    if not isinstance(msg, dict):
+        return False
+    model = msg.get("model")
+    return isinstance(model, str) and bool(model) and model != "<synthetic>"
+
+
+_AUTH_ERROR_TEXT = re.compile(r"\b401\b|/login|oauth|authenticat", re.IGNORECASE)
+
+
+def _is_auth_error_turn(entry: dict) -> bool:
+    """An API error placeholder that says the sign-in failed."""
+    if entry.get("type") != "assistant" or not entry.get("isApiErrorMessage"):
+        return False
+    if "auth" in str(entry.get("error") or "").lower():
+        return True
+    msg = entry.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    text = json.dumps(content) if content is not None else ""
+    return bool(_AUTH_ERROR_TEXT.search(text))
+
+
+def _file_turn_after(path: Path, after_ms: int):
+    """Newest sign-in evidence after after_ms in one transcript:
+    True  = a real primary turn (and no sign-in failure after it),
+    False = a sign-in failure after the last real turn,
+    None  = nothing after after_ms.
+    Reads the end of the file only, widening the window until it reaches an
+    entry older than after_ms (transcripts are append-only, oldest first)."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (str(path), st.st_mtime_ns, st.st_size, after_ms)
+    if key in _auth_turn_cache:
+        return _auth_turn_cache[key]
+    result = None
+    try:
+        with path.open("rb") as f:
+            for window in _AUTH_SCAN_WINDOWS:
+                start = max(0, st.st_size - window)
+                f.seek(start)
+                lines = f.read(st.st_size - start).split(b"\n")
+                if start > 0:
+                    lines = lines[1:]  # first line of the window may be cut
+                decided = False
+                for raw in reversed(lines):
+                    try:
+                        entry = json.loads(raw)
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    ts = _iso_to_ms(entry.get("timestamp"))
+                    if ts is None:
+                        continue
+                    if ts <= after_ms:
+                        decided = True
+                        break
+                    if _is_auth_error_turn(entry) and entry.get("entrypoint") in (None, "cli") \
+                            and not entry.get("isSidechain"):
+                        result = False
+                        decided = True
+                        break
+                    if _is_real_primary_turn(entry):
+                        result = True
+                        decided = True
+                        break
+                if decided or start == 0:
+                    break
+    except OSError:
+        result = None
+    if len(_auth_turn_cache) > 64:
+        _auth_turn_cache.clear()
+    _auth_turn_cache[key] = result
+    return result
+
+
+def _primary_turn_after(after_ms: int) -> bool:
+    """True if the primary session's own transcripts show a real turn made
+    after after_ms with no sign-in failure after it. Only top-level *.jsonl
+    in the primary project dir; the newest file with evidence decides."""
+    proj = _primary_project_dir()
+    try:
+        files = []
+        for jf in proj.glob("*.jsonl"):
+            try:
+                mtime_ms = jf.stat().st_mtime * 1000
+            except OSError:
+                continue
+            if jf.is_file() and mtime_ms > after_ms:
+                files.append((mtime_ms, jf))
+    except OSError:
+        return False
+    files.sort(key=lambda x: x[0], reverse=True)
+    for _, jf in files[:_AUTH_SCAN_MAX_FILES]:
+        found = _file_turn_after(jf, after_ms)
+        if found is not None:
+            return found
+    return False
+
+
+def _argv_is_claude(argv: list) -> bool:
+    for arg in argv[:3]:
+        if not arg:
+            continue
+        base = os.path.basename(arg)
+        if base == "claude" or "/claude/versions/" in arg or "@anthropic-ai/claude-code" in arg:
+            return True
+    return False
+
+
+def _claude_processes_sync():
+    """PIDs of every Claude process this user runs in the container. Read
+    only (/proc). None = could not tell."""
+    try:
+        uid = os.getuid()
+        found = []
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                if d.stat().st_uid != uid:
+                    continue
+                argv = [a.decode("utf-8", "replace")
+                        for a in (d / "cmdline").read_bytes().split(b"\0") if a]
+            except OSError:
+                continue
+            if _argv_is_claude(argv):
+                found.append(int(d.name))
+        return found
+    except Exception:
+        return None
+
+
+def _civ_is_established() -> bool:
+    """First sign-in already happened here (first boot fired or evolution done).
+    A newborn has neither marker, so its sign-in path is never changed."""
+    return FIRST_BOOT_MARKER.exists() or EVOLUTION_DONE_MARKER.exists()
+
+
+async def _established_ai_running() -> bool:
+    """True when this CIV is established and a Claude process runs (or that
+    cannot be told). Always False for a newborn."""
+    if not _civ_is_established():
+        return False
+    loop = asyncio.get_event_loop()
+    procs = await loop.run_in_executor(None, _claude_processes_sync)
+    return procs is None or len(procs) > 0
+
+
+async def _claude_auth_status_payload() -> dict:
+    """Honest Claude sign-in status.
+
+    Signed in when the access token is unexpired; or when it has expired, a
+    refresh token exists, and the primary session made a real turn after the
+    expiry (Claude refreshes in memory while it works). Otherwise signed out,
+    with a reason. A credentials file with no expiresAt keeps the old answer
+    (signed in). A running terminal session alone no longer counts as signed in.
+    """
+    if _engine_is_managed():
+        return {"authenticated": True, "managed": True, "account": None,
+                "expires_at": None, "subscription": None}
+    try:
+        if not CREDENTIALS_FILE.exists():
+            payload = {"authenticated": False, "account": None, "expires_at": None,
+                       "reason": "no_credentials"}
+        else:
+            creds = json.loads(CREDENTIALS_FILE.read_text())
+            oauth = creds.get("claudeAiOauth", {}) or {}
+            if not oauth.get("accessToken"):
+                payload = {"authenticated": False, "account": None, "expires_at": None,
+                           "reason": "no_access_token"}
+            else:
+                expires_at = oauth.get("expiresAt", 0)
+                signed_in = {"authenticated": True, "account": oauth.get("account"),
+                             "expires_at": expires_at, "subscription": oauth.get("subscriptionType")}
+                signed_out = {"authenticated": False, "account": oauth.get("account"),
+                              "expires_at": expires_at}
+                now_ms = int(time.time() * 1000)
+                if not expires_at:
+                    return {**signed_in, "reason": "no_expiry_recorded"}
+                if expires_at >= now_ms:
+                    return {**signed_in, "reason": "token_valid"}
+                if not oauth.get("refreshToken"):
+                    payload = {**signed_out, "reason": "expired_no_refresh_token"}
+                else:
+                    loop = asyncio.get_event_loop()
+                    active = await loop.run_in_executor(None, _primary_turn_after, int(expires_at))
+                    if active:
+                        return {**signed_in, "reason": "expired_but_session_active"}
+                    payload = {**signed_out, "reason": "expired_no_activity_since"}
+    except Exception:
+        payload = {"authenticated": False, "account": None, "expires_at": None,
+                   "reason": "unreadable_credentials"}
+    # Signed out: say whether an established CIV's AI is running, so the page
+    # shows a plain note instead of the sign-in flow (that flow types into the
+    # AI's pane and, on retry, stops every Claude). A newborn never gets this.
+    try:
+        payload["live_session"] = await _established_ai_running()
+    except Exception:
+        payload["live_session"] = False
+    return payload
+
+
 async def api_claude_auth_status(request: Request) -> JSONResponse:
     """Check if Claude is authenticated (has valid OAuth credentials)."""
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    if _engine_is_managed():
-        return JSONResponse({"authenticated": True, "managed": True, "account": None,
-                             "expires_at": None, "subscription": None})
-    try:
-        if not CREDENTIALS_FILE.exists():
-            return JSONResponse({"authenticated": False, "account": None, "expires_at": None})
-        creds = json.loads(CREDENTIALS_FILE.read_text())
-        oauth = creds.get("claudeAiOauth", {})
-        if not oauth.get("accessToken"):
-            return JSONResponse({"authenticated": False, "account": None, "expires_at": None})
-        expires_at = oauth.get("expiresAt", 0)
-        now_ms = int(time.time() * 1000)
-        # Claude Code refreshes tokens in memory without updating the file.
-        # If the tmux session is alive and Claude is running, trust it — the
-        # expiresAt in credentials.json is stale, not reality.
-        tmux_alive = False
-        r = await _run_subprocess_async(["tmux", "has-session", "-t", get_tmux_session()])
-        if r is not None and r.returncode == 0:
-            tmux_alive = True
-        if expires_at and expires_at < now_ms and not tmux_alive:
-            return JSONResponse({"authenticated": False, "account": oauth.get("account"),
-                                 "expires_at": expires_at})
-        return JSONResponse({
-            "authenticated": True, "account": oauth.get("account"),
-            "expires_at": expires_at, "subscription": oauth.get("subscriptionType"),
-        })
-    except Exception:
-        return JSONResponse({"authenticated": False, "account": None, "expires_at": None})
+    return JSONResponse(await _claude_auth_status_payload())
 
 
 async def api_claude_auth_start(request: Request) -> JSONResponse:
