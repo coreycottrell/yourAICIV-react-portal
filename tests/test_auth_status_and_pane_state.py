@@ -44,7 +44,7 @@ def _never_pkill_claude(monkeypatch):
     record calls so tests can assert a live session is never killed."""
     calls = []
 
-    async def fake_kill():
+    async def fake_kill(*a, **k):
         calls.append(time.time())
     monkeypatch.setattr(ps, "_kill_claude_process", fake_kill)
     return calls
@@ -249,10 +249,23 @@ class TestAuthStatusEndpoint:
         assert body["authenticated"] is False
         assert body["reason"] == "expired_no_refresh_token"
 
-    def test_long_expired_with_refresh_and_live_tmux_is_NOT_authenticated(self, client, auth_headers):
+    def test_long_expired_with_refresh_idle_is_signed_in_pending_refresh(self, client, auth_headers):
+        # Review round 2 (ticket 3383, finding e): an idle CIV never refreshes,
+        # so an access token 8 days old WITH a refresh token is not a sign-out.
         write_creds(self.creds, accessToken=ACCESS, refreshToken=REFRESH,
                     expiresAt=int(time.time() * 1000) - 204 * HOUR_MS)
-        assert self.get(client, auth_headers)["authenticated"] is False
+        body = self.get(client, auth_headers)
+        assert body["authenticated"] is True
+        assert body["reason"] == "expired_refresh_pending"
+
+    def test_long_expired_with_refresh_and_api_auth_failure_is_NOT_authenticated(self, client, auth_headers):
+        now = int(time.time() * 1000)
+        write_creds(self.creds, accessToken=ACCESS, refreshToken=REFRESH, expiresAt=now - 204 * HOUR_MS)
+        time.sleep(0.01)
+        self.add_turn(int(time.time() * 1000) + 1000, "auth_fail")  # the refresh grant is dead
+        body = self.get(client, auth_headers)
+        assert body["authenticated"] is False
+        assert body["reason"] == "expired_api_reports_auth_failure"
 
     def test_valid_token(self, client, auth_headers):
         write_creds(self.creds, accessToken=ACCESS, refreshToken=REFRESH,
@@ -265,15 +278,18 @@ class TestAuthStatusEndpoint:
     def test_no_credentials(self, client, auth_headers):
         assert self.get(client, auth_headers)["authenticated"] is False
 
-    def test_recent_expiry_pane_ok_WITHOUT_evidence_is_NOT_authenticated(self, client, auth_headers):
-        # Round 2 (skeptic case a): a clean pane alone is NOT proof. An idle CIV
-        # whose refresh token was revoked server-side looks exactly like this.
+    def test_recent_expiry_WITHOUT_evidence_is_signed_in_pending_refresh(self, client, auth_headers):
+        # Review round 2 (ticket 3383, finding e) reverses the Pyonair round-2
+        # "fail closed without evidence" rule: a healthy idle CIV looks exactly
+        # like this, and calling it signed out auto-opened a blocking modal and
+        # sent /login into its working session. A revoked grant shows up as an
+        # API auth failure on the CIV's next request (see the test below).
         write_creds(self.creds, accessToken=ACCESS, refreshToken=REFRESH,
                     expiresAt=int(time.time() * 1000) - 5 * 60_000)
         self.pane_text = "● Hourly recap sent to Yash."
         body = self.get(client, auth_headers)
-        assert body["authenticated"] is False
-        assert body["reason"] == "expired_no_evidence_of_refresh"
+        assert body["authenticated"] is True
+        assert body["reason"] == "expired_refresh_pending"
 
     def test_recent_expiry_with_real_turn_after_expiry_is_authenticated(self, client, auth_headers):
         now = int(time.time() * 1000)
@@ -284,20 +300,24 @@ class TestAuthStatusEndpoint:
         assert body["authenticated"] is True
         assert body["reason"] == "expired_refresh_proven_by_recent_turn"
 
-    def test_recent_expiry_pane_401_is_NOT_authenticated(self, client, auth_headers):
+    def test_pane_text_mentioning_401_does_not_flip_status(self, client, auth_headers):
+        # Review round 2 (finding e): the pane is no longer read. Old scrollback
+        # or the CIV's own conversation quoting "API Error: 401" is not an auth
+        # failure; only the API's structured error records are.
         write_creds(self.creds, accessToken=ACCESS, refreshToken=REFRESH,
                     expiresAt=int(time.time() * 1000) - 5 * 60_000)
-        self.pane_text = "API Error: 401 OAuth access token has expired"
-        assert self.get(client, auth_headers)["authenticated"] is False
-
-    def test_recent_expiry_pane_unreadable_fails_closed(self, client, auth_headers):
-        now = int(time.time() * 1000)
-        write_creds(self.creds, accessToken=ACCESS, refreshToken=REFRESH, expiresAt=now - 5 * 60_000)
-        self.add_turn(now - 60_000, "real")  # evidence present, so the pane guard is reached
-        self.pane_text = ""
+        self.pane_text = "we discussed the old API Error: 401 OAuth access token has expired"
         body = self.get(client, auth_headers)
-        assert body["authenticated"] is False
-        assert body["reason"] == "expired_pane_unreadable"
+        assert body["authenticated"] is True
+
+    def test_old_auth_failure_before_current_credentials_does_not_count(self, client, auth_headers):
+        # A failure logged BEFORE this credentials file was written (i.e. before
+        # the owner signed in again) says nothing about these credentials.
+        now = int(time.time() * 1000)
+        self.add_turn(now - 3 * HOUR_MS, "auth_fail")
+        write_creds(self.creds, accessToken=ACCESS, refreshToken=REFRESH, expiresAt=now - 5 * 60_000)
+        body = self.get(client, auth_headers)
+        assert body["authenticated"] is True
 
 
 # ---------------------------------------------------------------------------

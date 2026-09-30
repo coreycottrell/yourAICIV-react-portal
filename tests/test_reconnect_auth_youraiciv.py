@@ -25,7 +25,7 @@ REFRESH = "sk-ant-ort01-SECRET-REFRESH-TOKEN-do-not-leak"
 
 @pytest.fixture(autouse=True)
 def _never_pkill_claude(monkeypatch):
-    async def fake_kill():
+    async def fake_kill(*a, **k):
         return None
     monkeypatch.setattr(ps, "_kill_claude_process", fake_kill)
 
@@ -87,11 +87,15 @@ def test_BUG_expired_dead_token_with_live_tmux_is_signed_out(env):
     assert body["reason"] == "expired_no_refresh_token"
 
 
-def test_BUG_long_expired_with_refresh_and_live_tmux_is_signed_out(env):
+def test_long_expired_with_refresh_idle_is_not_signed_out(env):
+    """Review round 2, finding e: an idle CIV with a refresh token is not
+    signed out just because its access token is days old."""
     put, get, creds, _ = env
     now = int(time.time() * 1000)
     put(accessToken=ACCESS, refreshToken=REFRESH, expiresAt=now - 3 * 86_400_000)
-    assert get()["authenticated"] is False
+    body = get()
+    assert body["authenticated"] is True
+    assert body["reason"] == "expired_refresh_pending"
 
 
 def test_valid_credentials_are_signed_in(env):

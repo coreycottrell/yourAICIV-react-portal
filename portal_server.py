@@ -1914,8 +1914,13 @@ def _argv_is_claude(argv) -> bool:
     """True if a process argv looks like Claude Code (native or npm build)."""
     if not argv:
         return False
-    base = os.path.basename(str(argv[0])).lower()
+    arg0 = str(argv[0])
+    base = os.path.basename(arg0).lower()
     if base in ("claude", "claude.exe"):
+        return True
+    # Native installs exec the versioned binary directly, e.g.
+    # ~/.local/share/claude/versions/2.1.280 -> argv[0] basename "2.1.280".
+    if _VERSION_TITLE_RE.match(base) and "claude" in [p.lower() for p in Path(arg0).parts[:-1]]:
         return True
     if base in ("node", "nodejs", "bun"):
         return any("claude-code" in str(a) or os.path.basename(str(a)).lower() in ("claude", "cli.js", "claude.exe")
@@ -2028,8 +2033,72 @@ async def _is_claude_running_async(pane: str) -> bool:
 # scrollback), and the flow would hand out a stale URL (its state= no longer
 # matches) or report "already logged in". Found by the ticket-3383 sandbox
 # test: a second reconnect in the same session returned the first URL.
-_AUTH_FRESH_ONLY = ('logged_in', 'login_menu')
+# Review round 2 (ticket 3383): EVERY screen the flow acts on is fresh-checked,
+# not only the sign-in ones. The blocker patterns ("thumbs up", "Would you
+# recommend", "Do you want to trust", "command not found", ...) are ordinary
+# words that can sit in the CIV's own conversation; matched against old text
+# they made the portal press Escape / type "y" into the AI's live prompt.
+_AUTH_FRESH_ONLY = ('logged_in', 'login_menu', 'csat_survey', 'update_prompt',
+                    'trust_folder', 'mcp_server', 'error')
 _stale_oauth_urls: set = set()
+
+# Claude Code shows "esc to interrupt" in its status line while a turn runs.
+# Nothing is typed (no /login, no Escape) into a session that is mid-turn.
+_SESSION_BUSY_RE = re.compile(r'esc to interrupt', re.IGNORECASE)
+AUTH_BUSY_MESSAGE = ("Your AI is in the middle of a task right now. "
+                     "Try again in a minute, when it has finished.")
+
+
+def _session_is_busy(visible_text: str) -> bool:
+    return bool(visible_text) and bool(_SESSION_BUSY_RE.search(visible_text))
+
+
+# --- One sign-in flow at a time, and it can be cancelled -------------------
+# The state machine runs inside POST /api/auth/start for up to a few minutes.
+# Closing the Connect/Reconnect dialog must STOP it (it used to keep retrying
+# and send Escape + /login into the AI's pane after the owner cancelled), and a
+# second start must never run a second state machine against the same pane.
+class _AuthCancelled(Exception):
+    """The owner closed the sign-in dialog: stop, press nothing more."""
+
+
+class _AuthFlow:
+    def __init__(self, pane: str):
+        self.pane = pane
+        self.cancel = asyncio.Event()
+        self.finished = asyncio.Event()
+
+
+_auth_flow = None  # the ONE running sign-in state machine, or None
+
+
+def _auth_flow_running() -> bool:
+    return _auth_flow is not None and not _auth_flow.finished.is_set()
+
+
+def _auth_check(flow) -> None:
+    if flow is not None and flow.cancel.is_set():
+        raise _AuthCancelled()
+
+
+async def _auth_sleep(flow, seconds: float) -> None:
+    """Sleep, but wake up and stop at once if the flow is cancelled."""
+    if flow is None:
+        await asyncio.sleep(seconds)
+        return
+    _auth_check(flow)
+    try:
+        await asyncio.wait_for(flow.cancel.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        return
+    raise _AuthCancelled()
+
+
+async def _auth_key(pane: str, key: str, flow=None, literal: bool = False, check: bool = False):
+    """The ONLY way the sign-in flow presses keys: refuses once cancelled."""
+    _auth_check(flow)
+    cmd = ["tmux", "send-keys", "-t", pane] + (["-l", key] if literal else [key])
+    return await _run_subprocess_async(cmd, check=check)
 
 
 def _oauth_urls(content: str) -> list:
@@ -2052,8 +2121,9 @@ def _fresh_oauth_url(content: str, stale) -> str:
 
 
 def _classify_auth_screen(content: str, baseline: dict = None) -> str:
-    """Pure: screen type for the captured text. With a baseline, oauth_url /
-    logged_in / login_menu count only when they are NEW since the baseline."""
+    """Pure: screen type for the captured text. With a baseline, oauth_url and
+    every screen in _AUTH_FRESH_ONLY count only when they are NEW since the
+    baseline."""
     if not content:
         return 'empty'
     for name in AUTH_SCREEN_PRIORITY:
@@ -2090,25 +2160,32 @@ async def _detect_auth_screen(pane: str, baseline: dict = None) -> tuple:
     return _classify_auth_screen(content, baseline), content
 
 
-async def _dismiss_auth_blocker(pane: str, screen_type: str) -> bool:
-    """Dismiss a blocking dialog. Returns True if action was taken."""
+async def _dismiss_auth_blocker(pane: str, screen_type: str, flow=None) -> bool:
+    """Dismiss a blocking dialog. Returns True if action was taken.
+
+    Keys are pressed only when the blocker is on the VISIBLE screen right now
+    (scrollback left by tmux scroll-on-clear or old conversation text never
+    earns a key press)."""
+    if screen_type == 'mcp_server':
+        outcome = await _dismiss_mcp_dialog(pane, flow)
+        return outcome != "not_visible"
+    pattern = AUTH_SCREEN_PATTERNS.get(screen_type)
+    if pattern is None or not pattern.search(await _capture_visible(pane)):
+        return False
     if screen_type == 'csat_survey':
-        await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Escape"])
-        await asyncio.sleep(0.5)
-        await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Escape"])
+        await _auth_key(pane, "Escape", flow)
+        await _auth_sleep(flow, 0.5)
+        await _auth_key(pane, "Escape", flow)
         return True
     elif screen_type == 'update_prompt':
-        await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Escape"])
-        await asyncio.sleep(0.5)
+        await _auth_key(pane, "Escape", flow)
+        await _auth_sleep(flow, 0.5)
         return True
     elif screen_type == 'trust_folder':
-        await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "-l", "y"])
-        await asyncio.sleep(0.2)
-        await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"])
+        await _auth_key(pane, "y", flow, literal=True)
+        await _auth_sleep(flow, 0.2)
+        await _auth_key(pane, "Enter", flow)
         return True
-    elif screen_type == 'mcp_server':
-        outcome = await _dismiss_mcp_dialog(pane)
-        return outcome != "not_visible"
     return False
 
 
@@ -2190,7 +2267,7 @@ async def _capture_visible(pane: str) -> str:
     return await _run_subprocess_output(["tmux", "capture-pane", "-t", pane, "-p", "-J"], timeout=5) or ""
 
 
-async def _dismiss_mcp_dialog(pane: str) -> str:
+async def _dismiss_mcp_dialog(pane: str, flow=None) -> str:
     """Close the MCP startup dialog so /login can proceed. Returns an outcome:
     'enabled_this' | 'enabled_selected' | 'fallback_default' | 'fallback_escape'
     | 'not_visible' (nothing pressed: the dialog is not on the visible screen)."""
@@ -2199,36 +2276,106 @@ async def _dismiss_mcp_dialog(pane: str) -> str:
         return "not_visible"
     for _ in range(2):
         if plan["on_target"]:
-            await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"])
-            await asyncio.sleep(1.0)
+            await _auth_key(pane, "Enter", flow)
+            await _auth_sleep(flow, 1.0)
             return "enabled_this" if plan["variant"] == "single" else "enabled_selected"
         for key in plan["moves"]:
-            await _run_subprocess_async(["tmux", "send-keys", "-t", pane, key])
-            await asyncio.sleep(0.2)
-        await asyncio.sleep(0.4)
+            await _auth_key(pane, key, flow)
+            await _auth_sleep(flow, 0.2)
+        await _auth_sleep(flow, 0.4)
         new_plan = _plan_mcp_dialog(await _capture_visible(pane))
         if new_plan is None:
             return "not_visible"
         plan = new_plan
     # Could not confirm the cursor position: never leave the user stuck.
     if plan["variant"] == "single":
-        await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"])
-        await asyncio.sleep(1.0)
+        await _auth_key(pane, "Enter", flow)
+        await _auth_sleep(flow, 1.0)
         return "fallback_default"
-    await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Escape"])
-    await asyncio.sleep(1.0)
+    await _auth_key(pane, "Escape", flow)
+    await _auth_sleep(flow, 1.0)
     return "fallback_escape"
 
 
-async def _kill_claude_process() -> None:
-    """Kill any running Claude process in this container."""
-    await _run_subprocess_output(
-        ["bash", "-c", "pkill -f 'claude' 2>/dev/null; pkill -f 'node.*claude' 2>/dev/null; true"],
-        timeout=5,
-    )
+def _claude_pids_in_tree(root_pid, table: dict) -> set:
+    """PIDs of every Claude process in the process tree rooted at root_pid."""
+    try:
+        root = int(root_pid)
+    except (TypeError, ValueError):
+        return set()
+    children = {}
+    for pid, info in table.items():
+        children.setdefault(info["ppid"], []).append(pid)
+    found, stack, seen = set(), [root], set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        info = table.get(pid)
+        if info and _argv_is_claude(info["argv"]):
+            found.add(pid)
+        stack.extend(children.get(pid, []))
+    return found
 
 
-async def _run_auth_state_machine(pane: str) -> dict:
+def _all_claude_pids(table: dict) -> set:
+    return {pid for pid, info in table.items() if _argv_is_claude(info["argv"])}
+
+
+async def _pane_root_pid(pane: str):
+    out = await _run_subprocess_output(["tmux", "display-message", "-t", pane, "-p", "#{pane_pid}"], timeout=3)
+    try:
+        return int((out or "").strip())
+    except ValueError:
+        return None
+
+
+async def _signal_pids(pids, sig) -> None:
+    for pid in pids:
+        try:
+            os.kill(int(pid), sig)
+        except (ProcessLookupError, PermissionError, ValueError):
+            pass
+
+
+async def _kill_claude_process(pane: str, only=None, exclude=None) -> list:
+    """Stop the Claude process(es) running IN THIS PANE, by PID. Never pkill.
+
+    Only Claude processes found in the pane's own process tree are touched
+    (optionally narrowed to the PIDs in `only`, e.g. the /login instance this
+    portal launched). A Claude anywhere else in the container (the CIV's live
+    session in another pane, a background job) is never signalled. If no such
+    process can be identified, nothing is killed and [] is returned: the
+    caller must treat that as "refuse", not as "done".
+    """
+    root = await _pane_root_pid(pane)
+    if root is None:
+        return []
+    table = await asyncio.get_event_loop().run_in_executor(None, _read_proc_table)
+    pids = _claude_pids_in_tree(root, table)
+    if only is not None:
+        pids &= set(only)
+    if exclude:
+        pids -= set(exclude)
+    if not pids:
+        return []
+    await _signal_pids(pids, signal.SIGTERM)
+    for _ in range(12):
+        await asyncio.sleep(0.25)
+        alive = {p for p in pids if Path(f"/proc/{p}").exists()}
+        if not alive:
+            return sorted(pids)
+    await _signal_pids(alive, signal.SIGKILL)
+    return sorted(pids)
+
+
+AUTH_MAX_RETRIES = 3
+AUTH_CLAUDE_START_TIMEOUT_S = 45.0
+AUTH_URL_WAIT_TIMEOUT_S = 30.0
+
+
+async def _run_auth_state_machine(pane: str, flow: "_AuthFlow" = None) -> dict:
     """Run the auth flow state machine. Returns dict with status info.
 
     States: start -> waiting_for_screen -> (dismiss blockers | select_login) ->
@@ -2236,12 +2383,22 @@ async def _run_auth_state_machine(pane: str) -> dict:
 
     This is the core v2 auth logic ported from auth-flow-v2.py, adapted for
     async execution inside the portal server.
+
+    Safety rules (ticket 3383 review round 2):
+      * every key goes through _auth_key and every wait through _auth_sleep,
+        so cancelling `flow` (the owner closed the dialog) stops it at once;
+      * nothing is typed into a live session that is mid-turn;
+      * Escape is pressed only when a sign-in screen is ACTIVE on the visible
+        screen, never blindly;
+      * the only Claude ever killed is the `claude /login` THIS flow launched
+        into a shell pane, by PID; if it cannot be identified, nothing is
+        killed and the flow stops.
     """
     global _captured_oauth_url
-    max_retries = 3
+    max_retries = AUTH_MAX_RETRIES
     retry_count = 0
-    claude_start_timeout = 45.0
-    url_wait_timeout = 30.0
+    claude_start_timeout = AUTH_CLAUDE_START_TIMEOUT_S
+    url_wait_timeout = AUTH_URL_WAIT_TIMEOUT_S
     poll_interval = 0.5
     log_entries = []
 
@@ -2249,43 +2406,77 @@ async def _run_auth_state_machine(pane: str) -> dict:
         log_entries.append(msg)
         _save_portal_message(f"[auth-v2] {msg}", role="assistant")
 
+    def stop(**kw):
+        kw.setdefault("started", False)
+        kw["log"] = log_entries
+        return kw
+
+    async def keys(key, literal=False, check=False):
+        return await _auth_key(pane, key, flow, literal=literal, check=check)
+
+    async def nap(seconds):
+        await _auth_sleep(flow, seconds)
+
     live_session_present = False
+    closed_leftover = False
 
     # Clear tmux scrollback so stale text from prior runs cannot poison _detect_auth_screen
+    _auth_check(flow)
     await _run_subprocess_async(["tmux", "clear-history", "-t", pane])
 
     while retry_count <= max_retries:
+        _auth_check(flow)
         # --- Phase 1: Start Claude /login ---
         log(f"Starting auth flow (attempt {retry_count + 1}/{max_retries + 1})")
 
         # Resize tmux so URLs don't wrap
         await _run_subprocess_async(["tmux", "resize-window", "-t", pane, "-x", "500"])
-        await asyncio.sleep(0.3)
+        await nap(0.3)
 
         pane_state = await _pane_process_state(pane)
         # Remember whether the Claude in this pane is the CIV's LIVE session
         # (never ours to kill) or a /login instance this flow launched itself.
         if retry_count == 0:
             live_session_present = (pane_state == "claude")
+        launched_pre_pids = None
+        if pane_state == "claude":
+            visible = await _capture_visible(pane)
+            if _session_is_busy(visible):
+                log("Your AI is in the middle of a turn — nothing typed")
+                return stop(busy=True, error=AUTH_BUSY_MESSAGE)
+            leftover = _plan_auth_close(visible)
+            if leftover is not None:
+                # A sign-in screen from an earlier, abandoned attempt is still
+                # open. Close it (ONE key) and look again; never type /login
+                # into it.
+                if closed_leftover:
+                    log("A sign-in screen is still open after closing it once — nothing typed")
+                    return stop(error="a sign-in screen is still open; nothing typed")
+                closed_leftover = True
+                log(f"Closing a sign-in screen left from an earlier attempt ({leftover})")
+                await keys(leftover)
+                await nap(1.0)
+                continue
         # Snapshot what is already on screen so stale sign-in text is ignored.
         baseline = _auth_screen_baseline(await _capture_auth_screen(pane))
         _stale_oauth_urls.clear()
         _stale_oauth_urls.update(baseline["urls"])
         if pane_state == "shell":
+            table = await asyncio.get_event_loop().run_in_executor(None, _read_proc_table)
+            launched_pre_pids = _all_claude_pids(table)
             log("Claude not running (pane is at a shell) — launching 'claude /login'")
             launch_cmd = f"clear && cd {shlex.quote(str(Path.home()))} && claude /login"
-            await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "-l", launch_cmd], check=True)
-            await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
+            await keys(launch_cmd, literal=True, check=True)
+            await keys("Enter", check=True)
         elif pane_state == "claude":
             log("Claude already running — sending /login")
-            await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "-l", "/login"], check=True)
-            await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
+            await keys("/login", literal=True, check=True)
+            await keys("Enter", check=True)
         else:
             # Fail closed: never type a shell line (or anything) into a pane we
             # cannot identify — that is how a live Claude prompt got polluted.
             log("Pane is neither a shell nor a running Claude — refusing to type into it")
-            return {"started": False, "error": "primary pane state unknown; nothing typed",
-                    "log": log_entries}
+            return stop(error="primary pane state unknown; nothing typed")
 
         # --- Phase 2: Wait for screen and handle blockers ---
         phase_start = time.time()
@@ -2293,7 +2484,7 @@ async def _run_auth_state_machine(pane: str) -> dict:
         blocker_counts = {}
 
         while True:
-            await asyncio.sleep(poll_interval)
+            await nap(poll_interval)
             elapsed = time.time() - phase_start
 
             screen_type, screen_content = await _detect_auth_screen(pane, baseline)
@@ -2302,6 +2493,7 @@ async def _run_auth_state_machine(pane: str) -> dict:
                 # Goal state — extract the NEW URL (never one left from before)
                 url = _fresh_oauth_url(screen_content, baseline["urls"])
                 if url:
+                    _auth_check(flow)  # a cancelled flow never publishes a URL
                     _captured_oauth_url = url
                     log(f"OAuth URL captured ({len(url)} chars) in {elapsed:.1f}s")
                     return {"started": True, "url": url, "log": log_entries}
@@ -2314,25 +2506,26 @@ async def _run_auth_state_machine(pane: str) -> dict:
                 n = blocker_counts.get(screen_type, 0)
                 if n < AUTH_BLOCKER_MAX_DISMISSALS:
                     blocker_counts[screen_type] = n + 1
-                    log(f"Dismissing blocker: {screen_type} ({n + 1}/{AUTH_BLOCKER_MAX_DISMISSALS})")
                     if screen_type == 'mcp_server':
-                        outcome = await _dismiss_mcp_dialog(pane)
+                        outcome = await _dismiss_mcp_dialog(pane, flow)
                         log(f"MCP server dialog: {outcome}")
                     else:
-                        await _dismiss_auth_blocker(pane, screen_type)
-                    await asyncio.sleep(1.0)
+                        acted = await _dismiss_auth_blocker(pane, screen_type, flow)
+                        log(f"Blocker {screen_type}: {'dismissed' if acted else 'not on the visible screen, nothing pressed'}"
+                            f" ({n + 1}/{AUTH_BLOCKER_MAX_DISMISSALS})")
+                    await nap(1.0)
                     continue
                 # Cap reached: stop pressing keys at it and fall through to the timeout check.
 
             elif screen_type == 'login_menu' and not login_selected:
                 log("Login menu detected — selecting first option (Enter)")
-                await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"])
+                await keys("Enter")
                 login_selected = True
                 phase_start = time.time()  # Reset timeout for URL wait phase
                 continue
 
             elif screen_type == 'error':
-                log(f"Error detected on screen — will retry")
+                log("Error detected on screen — will retry")
                 break  # Break to retry loop
 
             # Check timeouts
@@ -2345,26 +2538,36 @@ async def _run_auth_state_machine(pane: str) -> dict:
         # --- Phase 3: Retry ---
         retry_count += 1
         if retry_count <= max_retries:
-            if live_session_present:
-                # Never kill the CIV's live session to get a login URL (that
-                # dropped Verun's working session, #3244). Close any menu and
-                # resend /login on the next attempt instead.
-                log(f"Retrying /login in the live session (retry {retry_count}/{max_retries})")
-                await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Escape"])
-                await asyncio.sleep(1.0)
+            if launched_pre_pids is None:
+                # The CIV's LIVE session: never killed (that dropped Verun's
+                # working session, #3244). Close an ACTIVE sign-in screen with
+                # one Escape; press nothing on any other screen.
+                visible = await _capture_visible(pane)
+                if _session_is_busy(visible):
+                    log("Your AI started a turn — stopping, nothing more typed")
+                    return stop(busy=True, error=AUTH_BUSY_MESSAGE)
+                if _plan_auth_close(visible) == "Escape":
+                    log(f"Retrying /login in the live session (retry {retry_count}/{max_retries})")
+                    await keys("Escape")
+                    await nap(1.0)
+                else:
+                    log(f"Retrying /login in the live session (retry {retry_count}/{max_retries}); no sign-in screen open, nothing pressed")
             else:
-                log(f"Killing Claude for clean restart (retry {retry_count}/{max_retries})")
-                await _kill_claude_process()
-                await asyncio.sleep(2.0)
-                # Verify it's dead
+                # Only the `claude /login` this flow launched (a Claude in this
+                # pane's own process tree that did not exist before the launch).
+                _auth_check(flow)
+                killed = await _kill_claude_process(pane, exclude=launched_pre_pids)
+                if killed:
+                    log(f"Stopped the sign-in Claude this portal launched (pid {', '.join(map(str, killed))}) for a clean retry")
+                    await nap(1.0)
                 if await _is_claude_running_async(pane):
-                    await _kill_claude_process()
-                    await asyncio.sleep(2.0)
+                    log("Could not safely identify the sign-in Claude to stop — stopping, nothing killed")
+                    return stop(error="could not safely stop the sign-in Claude; nothing killed")
             # Clear tmux scrollback before next attempt so stale error text cannot poison detection
             await _run_subprocess_async(["tmux", "clear-history", "-t", pane])
 
     log(f"Auth flow FAILED after {max_retries + 1} attempts")
-    return {"started": False, "error": "auth flow failed after retries", "log": log_entries}
+    return stop(error="auth flow failed after retries")
 
 
 # ---------------------------------------------------------------------------
@@ -2378,10 +2581,10 @@ async def _run_auth_state_machine(pane: str) -> dict:
 #   * no file / unreadable / no access token / no usable expiry -> false
 #   * access token not yet expired                                -> true
 #   * expired and refresh token empty (dead grant)                -> false
-#   * expired, refresh token present, expired > grace window      -> false
-#   * expired, refresh token present, within grace window         -> true only
-#     if the live pane shows no auth failure (Claude refreshes on its next
-#     request and rewrites the file; hourly BOOPs keep a healthy CIV fresh)
+#   * expired, refresh token present                              -> true,
+#     UNLESS the API reported an auth failure after these credentials were
+#     written (review round 2, ticket 3383: an idle CIV never refreshes, so an
+#     old expiresAt alone must not show "signed out" or open the modal)
 # Secrets (access/refresh tokens) are never returned.
 AUTH_EXPIRY_SKEW_MS = 60_000
 try:
@@ -2445,11 +2648,15 @@ def _evaluate_claude_credentials(creds_path: Path, now_ms: int = None) -> dict:
     if not isinstance(refresh, str) or not refresh.strip():
         out["reason"] = "expired_no_refresh_token"
         return out
+    # An expired ACCESS token with a refresh token is not a sign-out: Claude
+    # Code refreshes it on its next model request. An idle CIV makes none, so
+    # its file can show an access token hours or days old while it is fine.
+    # The caller decides from evidence (an auth failure reported by the API).
+    out["needs_live_check"] = True
     if now_ms - expires_at > AUTH_REFRESH_GRACE_S * 1000:
         out["reason"] = "expired_beyond_refresh_grace"
-        return out
-    out["reason"] = "expired_within_refresh_grace"
-    out["needs_live_check"] = True
+    else:
+        out["reason"] = "expired_within_refresh_grace"
     return out
 
 
@@ -2509,20 +2716,8 @@ def _classify_assistant_record(rec: dict):
     return None
 
 
-def _scan_transcript_tail(path: Path) -> dict:
-    res = {"last_real_ms": None, "last_auth_fail_ms": None}
-    try:
-        size = path.stat().st_size
-        with open(path, "rb") as fh:
-            start = max(0, size - _AUTH_EVIDENCE_TAIL_BYTES)
-            fh.seek(start)
-            data = fh.read()
-    except OSError:
-        return res
-    lines = data.split(b"\n")
-    if start > 0 and lines:
-        lines = lines[1:]  # first line is partial
-    for raw in reversed(lines):
+def _scan_lines(lines, res: dict, stop_early: bool = False) -> dict:
+    for raw in lines:
         if b'"assistant"' not in raw:
             continue
         try:
@@ -2536,34 +2731,89 @@ def _scan_transcript_tail(path: Path) -> dict:
         ts = _parse_iso_ms(rec.get("timestamp"))
         if ts is not None and (res[key] is None or ts > res[key]):
             res[key] = ts
-        if res["last_real_ms"] is not None and res["last_auth_fail_ms"] is not None:
+        if stop_early and res["last_real_ms"] is not None and res["last_auth_fail_ms"] is not None:
             break
+    return res
+
+
+def _scan_transcript_tail(path: Path) -> dict:
+    """Full scan of the last _AUTH_EVIDENCE_TAIL_BYTES of one transcript."""
+    res, _ = _scan_transcript_tail_with_offset(path)
+    return res
+
+
+def _scan_transcript_tail_with_offset(path: Path):
+    res = {"last_real_ms": None, "last_auth_fail_ms": None}
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            start = max(0, size - _AUTH_EVIDENCE_TAIL_BYTES)
+            fh.seek(start)
+            data = fh.read()
+    except OSError:
+        return res, None
+    end = data.rfind(b"\n")
+    complete = data[:end + 1] if end >= 0 else b""
+    lines = complete.split(b"\n")
+    if start > 0 and lines:
+        lines = lines[1:]  # first line is partial
+    _scan_lines(reversed(lines), res, stop_early=True)
+    return res, start + len(complete)
+
+
+# Per transcript: {"ino", "offset", "res"}. A growing transcript is read ONLY
+# from where the last scan stopped (review round 2: the active transcript
+# changes between every status call, so a (mtime, size) cache always missed and
+# each call re-read and parsed ~1.5 MB).
+
+
+def _scan_transcript_incremental(p: Path) -> dict:
+    try:
+        st = p.stat()
+    except OSError:
+        return {"last_real_ms": None, "last_auth_fail_ms": None}
+    key = str(p)
+    ent = _auth_evidence_cache.get(key)
+    grow = None if ent is None else st.st_size - ent["offset"]
+    if (ent is None or ent["offset"] is None or ent["ino"] != st.st_ino
+            or grow < 0 or grow > _AUTH_EVIDENCE_TAIL_BYTES):
+        res, offset = _scan_transcript_tail_with_offset(p)
+        _auth_evidence_cache[key] = {"ino": st.st_ino, "offset": offset, "res": dict(res)}
+        return res
+    if grow == 0:
+        return dict(ent["res"])
+    try:
+        with open(p, "rb") as fh:
+            fh.seek(ent["offset"])
+            data = fh.read(grow)
+    except OSError:
+        return dict(ent["res"])
+    end = data.rfind(b"\n")
+    if end < 0:
+        return dict(ent["res"])  # only a partial line so far
+    res = dict(ent["res"])
+    _scan_lines(data[:end + 1].split(b"\n"), res)
+    ent["offset"] += end + 1
+    ent["res"] = dict(res)
     return res
 
 
 def _auth_turn_evidence(paths=None) -> dict:
     """Newest real-turn and auth-failure timestamps (epoch ms) across the
-    newest few transcripts. Never raises; never returns transcript text."""
+    newest few transcripts. Never raises; never returns transcript text.
+    Cheap: an unchanged file costs one stat(), a growing one is read only from
+    where the previous scan stopped (_scan_transcript_incremental)."""
     out = {"last_real_ms": None, "last_auth_fail_ms": None}
     try:
         if paths is None:
             paths = _find_all_project_jsonl()[:_AUTH_EVIDENCE_MAX_FILES]
         for p in list(paths)[:_AUTH_EVIDENCE_MAX_FILES]:
-            p = Path(p)
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            key = (str(p), st.st_mtime_ns, st.st_size)
-            res = _auth_evidence_cache.get(key)
-            if res is None:
-                res = _scan_transcript_tail(p)
-                if len(_auth_evidence_cache) > 64:
-                    _auth_evidence_cache.clear()
-                _auth_evidence_cache[key] = res
+            res = _scan_transcript_incremental(Path(p))
             for k in out:
                 if res[k] is not None and (out[k] is None or res[k] > out[k]):
                     out[k] = res[k]
+        if len(_auth_evidence_cache) > 64:
+            _auth_evidence_cache.clear()
     except Exception:
         pass
     return out
@@ -2571,25 +2821,31 @@ def _auth_turn_evidence(paths=None) -> dict:
 
 def _decide_auth_with_evidence(ev: dict, evidence: dict, creds_mtime_ms):
     """Combine the credential check with transcript evidence. Returns
-    (authenticated, reason, still_needs_pane_check)."""
+    (authenticated, reason, still_needs_pane_check). The third value is kept
+    for callers and is always False now: the pane text is no longer consulted
+    (old scrollback or the CIV's own conversation mentioning "API Error: 401"
+    flipped the answer). Only structured API-error records count."""
     real = evidence.get("last_real_ms")
     fail = evidence.get("last_auth_fail_ms")
+    # An auth failure counts only if it happened after THESE credentials were
+    # written and nothing succeeded since.
+    fail_now = (fail is not None
+                and (creds_mtime_ms is None or fail > creds_mtime_ms)
+                and (real is None or fail > real))
     if ev["authenticated"]:
         # Unexpired token, but the API rejected it AFTER this credentials file
         # was written (and nothing succeeded since): revoked server-side.
-        if (fail is not None and creds_mtime_ms is not None and fail > creds_mtime_ms
-                and (real is None or fail > real)):
+        if fail_now and creds_mtime_ms is not None:
             return False, "token_rejected_by_api", False
         return True, ev["reason"], False
     if not ev["needs_live_check"]:
         return False, ev["reason"], False
-    # Expired within the grace window: signed in ONLY with positive evidence
-    # that the refresh grant worked after expiry. Otherwise fail closed.
-    if fail is not None and (real is None or fail >= real):
+    # Expired access token + refresh token present.
+    if fail_now:
         return False, "expired_api_reports_auth_failure", False
     if real is not None and ev["expires_at"] is not None and real >= ev["expires_at"]:
-        return True, "expired_refresh_proven_by_recent_turn", True
-    return False, "expired_no_evidence_of_refresh", False
+        return True, "expired_refresh_proven_by_recent_turn", False
+    return True, "expired_refresh_pending", False
 
 
 def _pane_shows_auth_failure(pane_text: str) -> bool:
@@ -2618,9 +2874,48 @@ def _engine_is_managed() -> bool:
     return False
 
 
+# The Claude account the engine is signed in as, for the Status page's "Engine
+# account" row (restored in review round 2; it matters most right after a
+# Reconnect used to switch accounts). An e-mail / label only — never a token.
+_ACCOUNT_LABEL_TTL_S = 30.0
+_ACCOUNT_FILE_MAX_BYTES = 32 * 1024 * 1024
+_account_label_cache: dict = {}
+
+
+def _claude_account_label(oauth, creds_mtime_ms=None):
+    def clean(v):
+        if isinstance(v, str) and v.strip() and len(v.strip()) <= 320 and "sk-ant-" not in v:
+            return v.strip()
+        return None
+    if isinstance(oauth, dict):
+        acct = oauth.get("account")
+        label = clean(acct)
+        if label is None and isinstance(acct, dict):
+            label = clean(acct.get("email_address")) or clean(acct.get("emailAddress"))
+        if label:
+            return label
+    p = Path.home() / ".claude.json"
+    now = time.time()
+    cached = _account_label_cache.get("v")
+    if cached and cached[1] == creds_mtime_ms and now - cached[0] < _ACCOUNT_LABEL_TTL_S:
+        return cached[2]
+    label = None
+    try:
+        if p.stat().st_size <= _ACCOUNT_FILE_MAX_BYTES:
+            oa = json.loads(p.read_text()).get("oauthAccount")
+            if isinstance(oa, dict):
+                label = clean(oa.get("emailAddress"))
+    except Exception:
+        label = None
+    _account_label_cache["v"] = (now, creds_mtime_ms, label)
+    return label
+
+
 async def api_claude_auth_status(request: Request) -> JSONResponse:
     """Report whether Claude is REALLY signed in (credential expiry + refresh
-    token + live pane check). Fails closed to not-authenticated when unsure."""
+    token + the API's own auth-failure records). Fails closed to
+    not-authenticated when the credentials are missing, unreadable, dead, or
+    the API has reported them rejected."""
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     if _engine_is_managed():
@@ -2630,27 +2925,23 @@ async def api_claude_auth_status(request: Request) -> JSONResponse:
         ev = _evaluate_claude_credentials(CREDENTIALS_FILE)
         authenticated = ev["authenticated"]
         reason = ev["reason"]
+        try:
+            creds_mtime_ms = int(CREDENTIALS_FILE.stat().st_mtime * 1000)
+        except OSError:
+            creds_mtime_ms = None
         if ev["authenticated"] or ev["needs_live_check"]:
-            try:
-                creds_mtime_ms = int(CREDENTIALS_FILE.stat().st_mtime * 1000)
-            except OSError:
-                creds_mtime_ms = None
             evidence = await asyncio.to_thread(_auth_turn_evidence)
-            authenticated, reason, pane_check = _decide_auth_with_evidence(ev, evidence, creds_mtime_ms)
-            if pane_check:
-                # Last guard for the grace path: an auth failure on the live
-                # pane overrides the transcript evidence. Unreadable -> closed.
-                pane_text = await _run_subprocess_output(
-                    ["tmux", "capture-pane", "-t", await _find_primary_pane_async(), "-p", "-S", "-40"],
-                    timeout=3,
-                )
-                if not pane_text:
-                    authenticated, reason = False, "expired_pane_unreadable"
-                elif _pane_shows_auth_failure(pane_text):
-                    authenticated, reason = False, "expired_pane_reports_auth_failure"
+            authenticated, reason, _ = _decide_auth_with_evidence(ev, evidence, creds_mtime_ms)
+        account = None
+        if creds_mtime_ms is not None:
+            try:
+                oauth = json.loads(CREDENTIALS_FILE.read_text()).get("claudeAiOauth")
+            except Exception:
+                oauth = None
+            account = await asyncio.to_thread(_claude_account_label, oauth, creds_mtime_ms)
         return JSONResponse({
             "authenticated": bool(authenticated),
-            "account": None,  # shape kept for the frontend; never a secret
+            "account": account,  # e-mail / label only; never a secret
             "reason": reason,
             "expires_at": ev["expires_at"],
             "subscription": ev["subscription"] if authenticated else None,
@@ -2668,20 +2959,37 @@ async def api_claude_auth_start(request: Request) -> JSONResponse:
     and polls for OAuth URL. Returns the URL inline when possible.
 
     This is a longer-running endpoint (up to ~60s) but returns WITH the URL
-    when the flow completes successfully.
+    when the flow completes successfully. Only ONE flow runs at a time; POST
+    /api/auth/close cancels it.
     """
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    global _captured_oauth_url
-    _captured_oauth_url = None
+    global _captured_oauth_url, _auth_flow, _auth_code_submission
+    if _auth_flow_running():
+        return JSONResponse({"started": False, "in_progress": True,
+                             "error": "A sign-in is already starting. Wait a moment, or close it and start again."})
     pane = await _find_primary_pane_async()
+    if _auth_flow_running():  # re-check after the await
+        return JSONResponse({"started": False, "in_progress": True,
+                             "error": "A sign-in is already starting. Wait a moment, or close it and start again."})
+    flow = _AuthFlow(pane)
+    _auth_flow = flow
+    _captured_oauth_url = None
+    _auth_code_submission = None
     _save_portal_message(f"Auth flow v2 started — {get_tmux_session()} (pane {pane})", role="assistant")
     try:
-        result = await _run_auth_state_machine(pane)
+        result = await _run_auth_state_machine(pane, flow)
         return JSONResponse(result)
+    except _AuthCancelled:
+        _save_portal_message("Auth flow v2 cancelled by the owner — stopped", role="assistant")
+        return JSONResponse({"started": False, "cancelled": True, "error": "sign-in cancelled"})
     except Exception as e:
         _save_portal_message(f"Auth flow v2 failed: {e}", role="assistant")
         return JSONResponse({"error": f"auth flow error: {e}"}, status_code=500)
+    finally:
+        flow.finished.set()
+        if _auth_flow is flow:
+            _auth_flow = None
 
 
 async def api_claude_auth_prewarm(request: Request) -> JSONResponse:
@@ -2697,6 +3005,8 @@ async def api_claude_auth_prewarm(request: Request) -> JSONResponse:
     # Don't start if already prewarming
     if _auth_prewarm_task and not _auth_prewarm_task.done():
         return JSONResponse({"status": "already_prewarming"})
+    if _auth_flow_running():
+        return JSONResponse({"status": "skipped", "reason": "a sign-in flow is running"})
     pane = await _find_primary_pane_async()
     _save_portal_message("Pre-warming Claude for auth...", role="assistant")
     try:
@@ -2719,10 +3029,39 @@ async def api_claude_auth_prewarm(request: Request) -> JSONResponse:
         return JSONResponse({"error": f"prewarm failed: {e}"}, status_code=500)
 
 
+# The code Claude's sign-in page shows is one token (letters, digits and a few
+# URL-safe marks, usually "<code>#<state>"). Anything else is refused before a
+# key is pressed: a newline inside it would submit whatever came before.
+_AUTH_CODE_RE = re.compile(r'[A-Za-z0-9._~#+/=\-]{8,4096}')
+_AUTH_PASTE_PROMPT_RE = re.compile(r'Paste code here', re.IGNORECASE)
+AUTH_NOT_WAITING_MESSAGE = ("The sign-in screen is not waiting for a code any more. "
+                            "Close this and start the sign-in again.")
+_auth_code_submission = None  # what the screen/credentials looked like when a code was typed
+
+
+def _pane_awaits_auth_code(visible_text: str) -> bool:
+    """Pure: is Claude Code's "Paste code here" prompt the ACTIVE screen? It
+    must be the last sign-in screen drawn, with no input prompt ("> ") and no
+    "Login successful" after it. Otherwise the code would be typed into the
+    AI's chat input and sent as a message."""
+    if not visible_text:
+        return False
+    lines = [ln for ln in visible_text.splitlines() if ln.strip()][-40:]
+    last_paste = max((i for i, ln in enumerate(lines) if _AUTH_PASTE_PROMPT_RE.search(ln)), default=-1)
+    if last_paste < 0:
+        return False
+    last_prompt = max((i for i, ln in enumerate(lines) if _AUTH_CLOSE_PROMPT_LINE_RE.match(ln)), default=-1)
+    last_finish = max((i for i, ln in enumerate(lines) if _AUTH_CLOSE_FINISH_RE.search(ln)), default=-1)
+    return last_paste > last_prompt and last_paste > last_finish
+
+
 async def api_claude_auth_code(request: Request) -> JSONResponse:
-    """Inject the OAuth authorization code into the Claude tmux session."""
+    """Type the OAuth authorization code into Claude's "Paste code here"
+    prompt — and ONLY there. Refuses (types nothing) when that prompt is not
+    the active screen of a running Claude."""
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
+    global _auth_code_submission
     try:
         body = await request.json()
         code = str(body.get("code", "")).strip()
@@ -2730,9 +3069,30 @@ async def api_claude_auth_code(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid json"}, status_code=400)
     if not code:
         return JSONResponse({"error": "empty code"}, status_code=400)
+    if not _AUTH_CODE_RE.fullmatch(code):
+        return JSONResponse({"injected": False,
+                             "error": "That does not look like a sign-in code. Copy the whole code and paste it again."},
+                            status_code=400)
+    if _auth_flow_running():
+        return JSONResponse({"injected": False, "not_waiting": True,
+                             "error": "The sign-in is still starting. Wait for the link, then paste the code."})
     pane = await _find_primary_pane_async()
-    _save_portal_message(f"Auth code submitted — injecting into {get_tmux_session()}...", role="assistant")
     try:
+        if await _pane_process_state(pane) != "claude":
+            return JSONResponse({"injected": False, "not_waiting": True, "error": AUTH_NOT_WAITING_MESSAGE})
+        visible = await _capture_visible(pane)
+        if _session_is_busy(visible) or not _pane_awaits_auth_code(visible):
+            _save_portal_message("Auth code NOT typed — the sign-in screen is not waiting for a code", role="assistant")
+            return JSONResponse({"injected": False, "not_waiting": True, "error": AUTH_NOT_WAITING_MESSAGE})
+        try:
+            creds_mtime_ns = CREDENTIALS_FILE.stat().st_mtime_ns
+        except OSError:
+            creds_mtime_ns = None
+        _auth_code_submission = {
+            "pane": pane, "at": time.time(), "creds_mtime_ns": creds_mtime_ns,
+            "baseline": _auth_screen_baseline(await _capture_auth_screen(pane)),
+        }
+        _save_portal_message(f"Auth code submitted — injecting into {get_tmux_session()}...", role="assistant")
         r = await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "-l", code], check=True)
         if r is None:
             return JSONResponse({"error": "tmux send-keys timed out"}, status_code=500)
@@ -2742,6 +3102,33 @@ async def api_claude_auth_code(request: Request) -> JSONResponse:
     except Exception as e:
         _save_portal_message(f"Code injection failed: tmux error — pane={pane}, err={e}", role="assistant")
         return JSONResponse({"error": f"tmux error: {e}"}, status_code=500)
+
+
+async def api_claude_auth_verify(request: Request) -> JSONResponse:
+    """GET /api/auth/verify — did the code typed by /api/auth/code produce a
+    REAL new sign-in? Needs BOTH: Claude Code printed a NEW "Login successful" /
+    "Logged in as" since the code was typed, AND the credentials file was
+    rewritten since then and is valid. A background token refresh rewrites
+    the file (and its expiresAt) but prints nothing, so it never counts."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    sub = _auth_code_submission
+    if not sub:
+        return JSONResponse({"confirmed": False, "state": "no_code_submitted"})
+    content = await _capture_auth_screen(sub["pane"])
+    pat = AUTH_SCREEN_PATTERNS['logged_in']
+    screen_ok = len(pat.findall(content or "")) > sub["baseline"]["counts"].get('logged_in', 0)
+    try:
+        mt = CREDENTIALS_FILE.stat().st_mtime_ns
+    except OSError:
+        mt = None
+    rewritten = mt is not None and (sub["creds_mtime_ns"] is None or mt > sub["creds_mtime_ns"])
+    valid = _evaluate_claude_credentials(CREDENTIALS_FILE)["authenticated"] if rewritten else False
+    confirmed = bool(screen_ok and rewritten and valid)
+    return JSONResponse({"confirmed": confirmed,
+                         "state": "confirmed" if confirmed else "waiting",
+                         "screen_confirmed": bool(screen_ok),
+                         "credentials_rewritten": bool(rewritten)})
 
 
 # ---------------------------------------------------------------------------
@@ -2787,22 +3174,47 @@ def _plan_auth_close(screen_text: str):
 
 
 async def api_claude_auth_close(request: Request) -> JSONResponse:
-    """POST /api/auth/close — tidy the live session after a reconnect."""
+    """POST /api/auth/close — the owner closed the sign-in dialog.
+
+    1. STOPS a running sign-in state machine (it presses nothing more).
+    2. Tidies the live session: at most ONE Escape (login picker / code
+       prompt) or ONE Enter (after "Login successful"), only when that screen
+       is active in a running Claude that is not mid-turn."""
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    global _captured_oauth_url
+    global _captured_oauth_url, _auth_code_submission
+    flow = _auth_flow
+    stopped = False
+    if flow is not None and not flow.finished.is_set():
+        flow.cancel.set()
+        try:
+            await asyncio.wait_for(flow.finished.wait(), timeout=8.0)
+            stopped = True
+        except asyncio.TimeoutError:
+            stopped = False
     _captured_oauth_url = None
-    pane = await _find_primary_pane_async()
+    _auth_code_submission = None
+    pane = flow.pane if flow is not None else await _find_primary_pane_async()
     try:
+        if flow is not None and not flow.finished.is_set():
+            return JSONResponse({"closed": False, "flow_stopped": False,
+                                 "reason": "sign-in flow did not stop in time; nothing pressed"})
         if await _pane_process_state(pane) != "claude":
-            return JSONResponse({"closed": False, "reason": "pane is not a running Claude; nothing pressed"})
+            return JSONResponse({"closed": False, "flow_stopped": stopped,
+                                 "reason": "pane is not a running Claude; nothing pressed"})
+        visible = await _capture_visible(pane)
+        # URLs on screen now are dead the moment the dialog closes.
+        _stale_oauth_urls.update(_oauth_urls(visible))
+        if _session_is_busy(visible):
+            return JSONResponse({"closed": False, "flow_stopped": stopped, "pressed": [],
+                                 "reason": "the AI is mid-turn; nothing pressed"})
         # ONE key per call, never a loop: a second Escape would land on the
         # live prompt.
-        key = _plan_auth_close(await _capture_visible(pane))
+        key = _plan_auth_close(visible)
         if key is None:
-            return JSONResponse({"closed": False, "pressed": []})
+            return JSONResponse({"closed": False, "flow_stopped": stopped, "pressed": []})
         await _run_subprocess_async(["tmux", "send-keys", "-t", pane, key])
-        return JSONResponse({"closed": True, "pressed": [key]})
+        return JSONResponse({"closed": True, "flow_stopped": stopped, "pressed": [key]})
     except Exception as e:
         return JSONResponse({"error": f"close failed: {e}"}, status_code=500)
 
@@ -2902,7 +3314,9 @@ async def api_evolution_first_boot(request: Request) -> JSONResponse:
 
     # Step 1: Double Ctrl-C to kill the /login Claude instance in the same pane
     _save_portal_message("Auth complete — transitioning to evolution (same pane)...", role="assistant")
-    await _kill_claude_process()
+    # Only the Claude in THIS pane (the /login instance), by PID. Never
+    # `pkill -f claude`, which killed every Claude process in the container.
+    await _kill_claude_process(pane)
 
     # Step 2: Wait for Claude to exit (up to 10s)
     exited = False
@@ -5476,6 +5890,7 @@ routes = [
     Route("/api/auth/url", endpoint=api_claude_auth_url),
     Route("/api/auth/prewarm", endpoint=api_claude_auth_prewarm, methods=["POST"]),
     Route("/api/auth/close", endpoint=api_claude_auth_close, methods=["POST"]),
+    Route("/api/auth/verify", endpoint=api_claude_auth_verify),
     Route("/api/evolution/status", endpoint=api_evolution_status),
     Route("/api/evolution/first-boot", endpoint=api_evolution_first_boot, methods=["POST"]),
     Route("/api/resume", endpoint=api_resume, methods=["POST"]),

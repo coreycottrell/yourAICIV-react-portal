@@ -1,5 +1,50 @@
 # Changelog
 
+## 2026-09-30 — Review round 2: the sign-in flow is safe in a live AI session
+
+An independent code review of the Reconnect Claude release found ten problems.
+All ten are fixed here (Witness ticket 3383):
+
+- **Closing the dialog now stops the sign-in.** Before, the server kept
+  retrying after the owner cancelled, pressing Escape and typing `/login` into
+  the AI's session. `POST /api/auth/close` now stops the running flow first,
+  and only one sign-in flow can run at a time (a second start is refused).
+- **The sign-in code is typed only into Claude's "Paste code here" prompt.**
+  If that prompt is not on screen, `POST /api/auth/code` types nothing and
+  says so. The page then goes back to "Start sign-in" for a fresh link, never
+  to "paste again". Codes that are not one clean token are refused too.
+- **Ordinary words in the conversation no longer press keys.** Words like
+  "thumbs up", "Would you recommend", "Do you want to trust" or "command not
+  found" are only acted on when they newly appear after `/login` and are on the
+  visible screen.
+- **The portal never runs `pkill -f claude`.** The only Claude it ever stops
+  is the `claude /login` it started itself in a shell pane, found by process
+  ID. If it cannot tell which process that is, it stops nothing. First-boot
+  stops only the Claude in its own pane. Native installs, which show up as
+  `…/claude/versions/2.1.x`, are now recognised as Claude.
+- **An idle AI is no longer shown as signed out.** An old access-token expiry
+  with a refresh token present means "refreshes on its next request", not
+  "signed out". It reads signed out only when the API itself reported an
+  authentication failure after these credentials were written. On-screen text
+  is no longer used as evidence.
+- **Nothing is typed into a session that is mid-turn** ("esc to interrupt" on
+  screen). A retry presses Escape only when a sign-in screen is actually open.
+- **"Already signed in" now closes the dialog** instead of spinning forever.
+- **A reconnect only counts a real new sign-in.** New `GET /api/auth/verify`
+  needs a new "Login successful" on screen and freshly written, valid
+  credentials. A background token refresh changes `expires_at` too, so that
+  alone no longer counts.
+- **The Status page's "Engine account" row is back.** It shows the account
+  e-mail from the credentials, or from `~/.claude.json` `oauthAccount`, and
+  never a token.
+- **Status checks are cheap.** Transcripts are read incrementally (only the
+  new bytes), not re-parsed on every call.
+
+Tests: 223 backend (29 new in `tests/test_review_round2_t3383.py`; the rest
+fail on the reviewed commit a8d2edd except for 2 positive controls), 102
+frontend (5 new in `src/test/reconnect-review2.test.tsx`, all failing on
+a8d2edd).
+
 ## 2026-09-30 — Reconnect Claude + real Claude sign-in status
 
 **New: "Reconnect Claude" button.** Always visible in the header (and in

@@ -38,7 +38,7 @@ def _never_pkill_claude(monkeypatch):
     """SAFETY: the real _kill_claude_process runs `pkill -f claude`."""
     calls = []
 
-    async def fake_kill():
+    async def fake_kill(*a, **k):
         calls.append(time.time())
     monkeypatch.setattr(ps, "_kill_claude_process", fake_kill)
     return calls
@@ -434,20 +434,24 @@ class TestTranscriptEvidence:
         assert res["last_real_ms"] == 3_000_123
         assert res["last_auth_fail_ms"] == 2_000_123
 
-    def test_evidence_is_cached_on_path_mtime_size(self, tmp_path, monkeypatch):
+    def test_evidence_scans_once_then_reads_only_appended_bytes(self, tmp_path, monkeypatch):
+        # Review round 2 (finding j): the active transcript grows between every
+        # status call, so a (mtime, size) cache always missed and re-read the
+        # whole tail. Now: ONE full tail scan, then only the appended bytes.
         ps._auth_evidence_cache.clear()
         f = tmp_path / "s.jsonl"
         f.write_text(json.dumps(_row(5_000_000, "real")) + "\n")
-        calls = []
-        real_scan = ps._scan_transcript_tail
-        monkeypatch.setattr(ps, "_scan_transcript_tail", lambda p: calls.append(p) or real_scan(p))
+        full = []
+        real_full = ps._scan_transcript_tail_with_offset
+        monkeypatch.setattr(ps, "_scan_transcript_tail_with_offset", lambda p: full.append(p) or real_full(p))
         a = ps._auth_turn_evidence([f])
         b = ps._auth_turn_evidence([f])
-        assert a == b and len(calls) == 1
+        assert a == b and len(full) == 1
         with open(f, "a") as fh:
             fh.write(json.dumps(_row(6_000_000, "auth_fail")) + "\n")
         c = ps._auth_turn_evidence([f])
-        assert len(calls) == 2 and c["last_auth_fail_ms"] == 6_000_123
+        assert len(full) == 1, "a growing file must not be re-scanned from its tail"
+        assert c["last_auth_fail_ms"] == 6_000_123 and c["last_real_ms"] == 5_000_123
 
     def test_evidence_never_raises(self, tmp_path):
         assert ps._auth_turn_evidence([tmp_path / "missing.jsonl"]) == {
@@ -470,17 +474,26 @@ class TestDecideWithEvidence:
     def ev(self, real=None, fail=None):
         return {"last_real_ms": real, "last_auth_fail_ms": fail}
 
-    def test_grace_without_any_evidence_fails_closed(self):
+    def test_expired_without_any_evidence_is_pending_refresh_not_signed_out(self):
+        # Review round 2 (ticket 3383, finding e): idle != signed out.
         assert ps._decide_auth_with_evidence(self.grace(), self.ev(), None)[:2] == (
-            False, "expired_no_evidence_of_refresh")
+            True, "expired_refresh_pending")
 
-    def test_grace_with_turn_only_BEFORE_expiry_fails_closed(self):
-        # skeptic: idle CIV, revoked refresh token, last good turn predates expiry
-        assert ps._decide_auth_with_evidence(self.grace(), self.ev(real=self.EXP - 1), None)[0] is False
+    def test_expired_with_turn_only_BEFORE_expiry_is_pending_refresh(self):
+        # Idle since before expiry: nothing says the refresh grant is dead.
+        assert ps._decide_auth_with_evidence(self.grace(), self.ev(real=self.EXP - 1), None)[:2] == (
+            True, "expired_refresh_pending")
 
-    def test_grace_with_turn_after_expiry_passes_to_pane_guard(self):
+    def test_expired_with_turn_after_expiry_is_proven(self):
+        # The pane is no longer consulted (third value always False).
         assert ps._decide_auth_with_evidence(self.grace(), self.ev(real=self.EXP + 1), None) == (
-            True, "expired_refresh_proven_by_recent_turn", True)
+            True, "expired_refresh_proven_by_recent_turn", False)
+
+    def test_expired_failure_before_current_creds_does_not_count(self):
+        mtime = self.EXP + 10
+        assert ps._decide_auth_with_evidence(self.grace(), self.ev(fail=self.EXP + 5), mtime)[0] is True
+        assert ps._decide_auth_with_evidence(self.grace(), self.ev(fail=mtime + 5), mtime)[:2] == (
+            False, "expired_api_reports_auth_failure")
 
     def test_grace_auth_failure_after_last_turn_is_not_signed_in(self):
         out = ps._decide_auth_with_evidence(self.grace(), self.ev(real=self.EXP + 1, fail=self.EXP + 2), None)
@@ -554,13 +567,26 @@ class TestAuthStatusEndpointRound2:
         assert set(r.json()) == {"authenticated", "account", "reason", "expires_at", "subscription"}
         return r.json()
 
-    def test_skeptic_a1_expired_30min_refresh_clean_pane_idle_is_NOT_signed_in(self):
+    def test_idle_expired_30min_with_refresh_is_signed_in_pending(self):
+        # Was "skeptic a1: NOT signed in". Review round 2 (ticket 3383, finding
+        # e) reverses it: this is exactly a healthy idle CIV, and calling it
+        # signed out opened a blocking modal over a working AI.
         now = int(time.time() * 1000)
         self.put_creds(accessToken=ACCESS, refreshToken=REFRESH, expiresAt=now - 30 * 60_000)
         self.turn(now - 3 * HOUR_MS, "real")  # last activity long before expiry
         body = self.get()
+        assert body["authenticated"] is True
+        assert body["reason"] == "expired_refresh_pending"
+
+    def test_idle_expired_then_api_rejects_refresh_is_NOT_signed_in(self):
+        now = int(time.time() * 1000)
+        self.put_creds(accessToken=ACCESS, refreshToken=REFRESH, expiresAt=now - 30 * 60_000)
+        self.turn(now - 3 * HOUR_MS, "real")
+        time.sleep(0.01)
+        self.turn(int(time.time() * 1000) + 1000, "auth_fail")  # next request: grant dead
+        body = self.get()
         assert body["authenticated"] is False
-        assert body["reason"] == "expired_no_evidence_of_refresh"
+        assert body["reason"] == "expired_api_reports_auth_failure"
 
     def test_expired_but_refresh_proven_by_turn_after_expiry_is_signed_in(self):
         now = int(time.time() * 1000)
@@ -570,18 +596,21 @@ class TestAuthStatusEndpointRound2:
         assert body["authenticated"] is True
         assert body["reason"] == "expired_refresh_proven_by_recent_turn"
 
-    def test_proven_turn_but_pane_401_is_NOT_signed_in(self):
+    def test_proven_turn_and_old_pane_401_text_stays_signed_in(self):
+        # The pane is no longer read (finding e): scrollback text is not evidence.
         now = int(time.time() * 1000)
         self.put_creds(accessToken=ACCESS, refreshToken=REFRESH, expiresAt=now - 30 * 60_000)
         self.turn(now - 60_000, "real")
         self.pane_text = "API Error: 401 · Please run /login"
-        assert self.get()["reason"] == "expired_pane_reports_auth_failure"
+        body = self.get()
+        assert body["authenticated"] is True
+        assert body["reason"] == "expired_refresh_proven_by_recent_turn"
 
-    def test_expired_rate_limited_only_is_NOT_proof(self):
+    def test_expired_rate_limited_only_is_neither_proof_nor_failure(self):
         now = int(time.time() * 1000)
         self.put_creds(accessToken=ACCESS, refreshToken=REFRESH, expiresAt=now - 30 * 60_000)
         self.turn(now - 60_000, "rate_limit")
-        assert self.get()["authenticated"] is False
+        assert self.get()["reason"] == "expired_refresh_pending"
 
     def test_skeptic_a2_valid_token_empty_refresh_is_signed_in_until_rejected(self):
         now = int(time.time() * 1000)

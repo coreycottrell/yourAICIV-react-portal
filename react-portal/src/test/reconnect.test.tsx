@@ -8,6 +8,7 @@ import { render, screen, fireEvent, act } from '@testing-library/react'
 
 const api = vi.hoisted(() => ({
   status: { authenticated: true, reason: 'token_valid', expires_at: 1000 } as Record<string, unknown>,
+  verify: { confirmed: false, state: 'waiting' } as Record<string, unknown>,
   get: vi.fn(),
   post: vi.fn(),
   fire: vi.fn(),
@@ -28,6 +29,7 @@ function setupApi() {
   api.get.mockImplementation(async (path: string) => {
     if (path === '/api/auth/status') return { ...api.status }
     if (path === '/api/auth/url') return { url: 'https://claude.ai/oauth/authorize?x=1&state=abc', ready: true }
+    if (path === '/api/auth/verify') return { ...api.verify }
     return {}
   })
   api.post.mockImplementation(async (path: string) => {
@@ -51,6 +53,7 @@ function posted(path: string) {
 beforeEach(() => {
   api.get.mockReset(); api.post.mockReset(); api.fire.mockReset()
   api.status = { authenticated: true, reason: 'token_valid', expires_at: 1000 }
+  api.verify = { confirmed: false, state: 'waiting' }
   setupApi()
 })
 afterEach(() => { vi.useRealTimers() })
@@ -113,7 +116,7 @@ describe('ClaudeAuthFlow', () => {
     expect(posted('/api/auth/close')).toBe(1)
   })
 
-  it('reconnect: the OLD still-valid token does not count; new credentials do; never re-runs first boot', async () => {
+  it('reconnect: only a server-confirmed NEW sign-in counts (not an expires_at change); never re-runs first boot', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     render(<><ReconnectClaudeButton /><ClaudeAuthFlow /></>)
     await flush()
@@ -131,8 +134,13 @@ describe('ClaudeAuthFlow', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(3100) })
     expect(screen.getByText(/Verifying/)).toBeInTheDocument()
 
-    // New credentials land.
+    // A background token refresh changes expires_at: NOT a sign-in (review round 2, finding h).
     api.status = { authenticated: true, reason: 'token_valid', expires_at: 999999 }
+    await act(async () => { await vi.advanceTimersByTimeAsync(3100) })
+    expect(screen.getByText(/Verifying/)).toBeInTheDocument()
+
+    // The server confirms a real new sign-in.
+    api.verify = { confirmed: true, state: 'confirmed' }
     await act(async () => { await vi.advanceTimersByTimeAsync(3100) })
     expect(screen.getByText(/signed in again/)).toBeInTheDocument()
     expect(api.fire).not.toHaveBeenCalled()

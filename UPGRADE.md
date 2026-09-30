@@ -8,10 +8,13 @@ ever sees a finished result, never these steps.
 
 | File | Change |
 |---|---|
-| `portal_server.py` | replaced (real sign-in status, safe sign-in flow, `/api/auth/close`) |
+| `portal_server.py` | replaced (real sign-in status, safe sign-in flow, `/api/auth/close`, `/api/auth/verify`) |
 | `react-portal/dist/index.html` | replaced (points at the new bundle) |
 | `react-portal/dist/assets/index-*.js`, `index-*.css` | new bundle files added (old ones may stay) |
 | `CHANGELOG.md`, `UPGRADE.md` | new, documentation only |
+
+(Review round 2, same release line: still only these files. The bundle file
+name changes again — copy the whole `react-portal/dist/` directory.)
 
 Nothing else changes: `trial_gate.py`, `site_proxy.py`, `env_file.py`,
 `start.sh`, `skills/`, `civ-tools/` are identical to the previous release
@@ -47,6 +50,9 @@ Nothing else changes: `trial_gate.py`, `site_proxy.py`, `env_file.py`,
      now includes a `"reason"` field and matches reality (signed in only if
      Claude really is).
    - The portal header shows **Reconnect Claude** (hard refresh the page).
+   - `curl -s -H "Authorization: Bearer $(cat .portal-token)" http://127.0.0.1:<port>/api/auth/verify`
+     answers `{"confirmed": false, "state": "no_code_submitted"}` (the new
+     endpoint exists). An AI that is idle but fine must read `authenticated: true`.
    - Chat still answers (alive is not serving — send one real message).
 
 ## Rollback
