@@ -13,8 +13,10 @@ ever sees a finished result, never these steps.
 | `react-portal/dist/assets/index-*.js`, `index-*.css` | new bundle files added (old ones may stay) |
 | `CHANGELOG.md`, `UPGRADE.md` | new, documentation only |
 
-(Review round 2, same release line: still only these files. The bundle file
-name changes again — copy the whole `react-portal/dist/` directory.)
+(Review rounds 2 and 3, same release line: still only these files. The bundle
+file name changes with each round — copy the whole `react-portal/dist/`
+directory. Optional new setting: `PORTAL_AUTH_REFRESH_MAX_IDLE_S`, default
+14 days. That is how long an idle AI with a refresh token still reads signed in.)
 
 Nothing else changes: `trial_gate.py`, `site_proxy.py`, `env_file.py`,
 `start.sh`, `skills/`, `civ-tools/` are identical to the previous release

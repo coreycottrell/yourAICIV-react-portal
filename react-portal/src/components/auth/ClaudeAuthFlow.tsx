@@ -86,8 +86,15 @@ export function ClaudeAuthFlow() {
   const statusPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const reconnectRef = useRef(false)
+  // Opened by the owner (Reconnect button), never by a signed-out page load:
+  // such a flow never fires the first-boot awakening, even if Claude happens
+  // to be signed out (an established AI whose sign-in expired).
+  const ownerOpenedRef = useRef(false)
   // Bumped whenever the flow is opened, closed or restarted.
   const flowRef = useRef(0)
+  // Sent with Start and Close so the server can cancel a Start that arrives
+  // after its Close.
+  const attemptRef = useRef('')
 
   const clearPolls = useCallback(() => {
     if (urlPollRef.current) {
@@ -149,6 +156,7 @@ export function ClaudeAuthFlow() {
       setError(null)
       setAuthUrl(null)
       setCode('')
+      ownerOpenedRef.current = true
       reconnectRef.current = true
       setReconnectMode(true)
       setAuthenticated(false)
@@ -172,8 +180,9 @@ export function ClaudeAuthFlow() {
     // Stops the server's sign-in flow, then leaves the AI's own pane clean:
     // close the login picker / code prompt (cancel) or the "Press Enter to
     // continue" screen (after success).
-    apiPost('/api/auth/close').catch(() => {})
+    apiPost('/api/auth/close', attemptRef.current ? { attempt: attemptRef.current } : undefined).catch(() => {})
     reconnectRef.current = false
+    ownerOpenedRef.current = false
     setReconnectMode(false)
     setError(null)
     setAuthUrl(null)
@@ -194,8 +203,9 @@ export function ClaudeAuthFlow() {
   const finishSignedIn = useCallback((text: string) => {
     clearPolls()
     window.dispatchEvent(new CustomEvent(AUTH_CHANGED_EVENT))
-    if (reconnectRef.current) {
-      // Reconnect is not a birth: never re-run the awakening.
+    if (reconnectRef.current || ownerOpenedRef.current) {
+      // Reconnect is not a birth: never re-run the awakening. closeFlow
+      // presses Enter on Claude's "Login successful … Press Enter" screen.
       setSuccessText(text)
       setStep('success')
       closeTimerRef.current = setTimeout(closeFlow, 2500)
@@ -203,18 +213,25 @@ export function ClaudeAuthFlow() {
     }
     // Auth confirmed — fire evolution and dismiss immediately.
     // Do NOT wait for evolution to complete (takes 10+ min).
-    // Human watches evolution in terminal/chat.
-    fireFirstBoot().catch(() => {})
+    // Human watches evolution in terminal/chat. If the awakening does not
+    // run (this AI already evolved), tidy Claude's "Press Enter" screen.
+    fireFirstBoot()
+      .then(r => {
+        if (r && r.status !== 'fired') apiPost('/api/auth/close').catch(() => {})
+      })
+      .catch(() => {})
     setAuthenticated(true)
   }, [clearPolls, closeFlow])
 
   const handleStart = useCallback(async () => {
     clearPolls()
     const flow = ++flowRef.current
+    const attempt = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+    attemptRef.current = attempt
     setError(null)
     setStep('starting')
     try {
-      const res = await apiPost<StartResponse>('/api/auth/start')
+      const res = await apiPost<StartResponse>('/api/auth/start', { attempt })
       if (flow !== flowRef.current) return  // closed or restarted meanwhile
       if (res.cancelled) {
         restartWith(null)

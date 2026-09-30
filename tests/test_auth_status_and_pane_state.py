@@ -163,7 +163,9 @@ class TestAuthScreenPatterns:
         assert pr.index("login_menu") < pr.index("csat_survey")
 
 
-class TestPaneAuthFailure:
+class TestAuthFailureText:
+    """The failure markers still classify synthetic API-error transcript rows
+    (the pane itself is no longer read, review round 2)."""
     @pytest.mark.parametrize("text", [
         "API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}",
         "OAuth access token has expired. Please run /login",
@@ -171,11 +173,11 @@ class TestPaneAuthFailure:
         "Unable to validate model: Could not resolve authentication method",
     ])
     def test_failure_markers(self, text):
-        assert ps._pane_shows_auth_failure(text) is True
+        assert bool(ps._AUTH_FAILURE_PANE_RE.search(text)) is True
 
     def test_healthy_pane(self):
-        assert ps._pane_shows_auth_failure("> hello\n● Hi Yash, here is your recap") is False
-        assert ps._pane_shows_auth_failure("") is False
+        assert bool(ps._AUTH_FAILURE_PANE_RE.search("> hello\n● Hi Yash, here is your recap")) is False
+        assert bool(ps._AUTH_FAILURE_PANE_RE.search("")) is False
 
 
 # ---------------------------------------------------------------------------

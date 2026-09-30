@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026-09-30 — Review round 3: closing the gaps a second review found
+
+A second independent review of round 2 found the fixes incomplete in places.
+All of it is fixed:
+
+- A blocking dialog only earns a key press when it is the ACTIVE screen (drawn
+  below the last input prompt). The same words in the AI's own conversation
+  never do. Before any key press inside the sign-in flow, the portal checks
+  whether the AI is mid-turn, and stops if it is.
+- A startup dialog that is already open (new MCP server, trust, update) is
+  dismissed properly before `/login` is typed. Before, `/login` + Enter went
+  into it and could pick "Continue without using this MCP server".
+- Start and Close carry the same `attempt` id. A Close that reaches the server
+  before its Start still cancels that Start, and Start registers itself before
+  it awaits anything. Prewarm holds the same one-flow slot.
+- "Idle is not signed out" is now bounded: 14 days after the access token
+  expired with no use, the AI reads signed out (`expired_refresh_too_old`,
+  `PORTAL_AUTH_REFRESH_MAX_IDLE_S`).
+- The Reconnect Claude button never fires the first-boot awakening, even when
+  Claude is signed out. After a sign-in where the awakening does not run, the
+  "Press Enter to continue" screen is tidied.
+- `/api/auth/verify` reads the ACTIVE "Login successful … Press Enter" screen
+  instead of counting lines that can scroll away or be redrawn.
+- The transcript scan is locked, so parallel status calls cannot skip data.
+  Credentials are parsed once per status call. The `~/.claude.json` account
+  label is re-read only when that file changes, and a half-written file keeps
+  the last good label.
+- Up to 3 leftover sign-in screens are closed one key at a time, and the
+  message the owner sees is in plain language. Dead code has been removed.
+
+Tests: 235 backend (12 new in `tests/test_review_round3_t3383.py`: 11 fail on
+8b6c2b0, 1 positive control) and 105 frontend (3 new in
+`src/test/reconnect-review3.test.tsx`, all failing on 8b6c2b0).
+
 ## 2026-09-30 — Review round 2: the sign-in flow is safe in a live AI session
 
 An independent code review of the Reconnect Claude release found ten problems.

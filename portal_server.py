@@ -2047,10 +2047,38 @@ _stale_oauth_urls: set = set()
 _SESSION_BUSY_RE = re.compile(r'esc to interrupt', re.IGNORECASE)
 AUTH_BUSY_MESSAGE = ("Your AI is in the middle of a task right now. "
                      "Try again in a minute, when it has finished.")
+AUTH_STUCK_MESSAGE = ("Claude has another screen open that the sign-in could not close. "
+                      "Wait a minute and try again.")
 
 
 def _session_is_busy(visible_text: str) -> bool:
     return bool(visible_text) and bool(_SESSION_BUSY_RE.search(visible_text))
+
+
+_INPUT_PROMPT_LINE_RE = re.compile(r'^\s*[│|]?\s*>(?:\s|$)')
+
+
+def _blocker_is_active(visible_text: str, pattern) -> bool:
+    """Pure: is a blocking dialog matching `pattern` the ACTIVE screen? Claude
+    Code draws its dialogs in place of the input box, so the match must come
+    AFTER the last input-prompt line ("> "). The same words higher up are the
+    AI's own conversation and never earn a key press (review round 2, #1)."""
+    if not visible_text:
+        return False
+    lines = [ln for ln in visible_text.splitlines() if ln.strip()][-40:]
+    last_prompt = max((i for i, ln in enumerate(lines) if _INPUT_PROMPT_LINE_RE.match(ln)), default=-1)
+    last_match = max((i for i, ln in enumerate(lines) if pattern.search(ln)), default=-1)
+    return last_match > last_prompt
+
+
+def _active_blocker(visible_text: str):
+    """Which blocking dialog (if any) is ACTIVE on the visible screen now."""
+    if _plan_mcp_dialog(visible_text) is not None:
+        return 'mcp_server'
+    for name in ('trust_folder', 'update_prompt', 'csat_survey'):
+        if _blocker_is_active(visible_text, AUTH_SCREEN_PATTERNS[name]):
+            return name
+    return None
 
 
 # --- One sign-in flow at a time, and it can be cancelled -------------------
@@ -2063,13 +2091,31 @@ class _AuthCancelled(Exception):
 
 
 class _AuthFlow:
-    def __init__(self, pane: str):
+    def __init__(self, pane: str = None, attempt: str = None):
         self.pane = pane
+        self.attempt = attempt
         self.cancel = asyncio.Event()
         self.finished = asyncio.Event()
 
 
+async def _auth_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+        return body if isinstance(body, dict) else {}
+    except Exception:
+        return {}
+
+
+def _attempt_id(body: dict):
+    a = body.get("attempt")
+    return a[:64] if isinstance(a, str) and a else None
+
+
 _auth_flow = None  # the ONE running sign-in state machine, or None
+# Attempt ids the owner already closed. The browser sends the same id with
+# Start and Close, so a Close that reaches the server BEFORE its Start still
+# cancels that Start (review round 2, #3).
+_closed_attempts: list = []
 
 
 def _auth_flow_running() -> bool:
@@ -2170,7 +2216,10 @@ async def _dismiss_auth_blocker(pane: str, screen_type: str, flow=None) -> bool:
         outcome = await _dismiss_mcp_dialog(pane, flow)
         return outcome != "not_visible"
     pattern = AUTH_SCREEN_PATTERNS.get(screen_type)
-    if pattern is None or not pattern.search(await _capture_visible(pane)):
+    if pattern is None:
+        return False
+    visible = await _capture_visible(pane)
+    if _session_is_busy(visible) or not _blocker_is_active(visible, pattern):
         return False
     if screen_type == 'csat_survey':
         await _auth_key(pane, "Escape", flow)
@@ -2417,8 +2466,8 @@ async def _run_auth_state_machine(pane: str, flow: "_AuthFlow" = None) -> dict:
     async def nap(seconds):
         await _auth_sleep(flow, seconds)
 
-    live_session_present = False
-    closed_leftover = False
+    closed_leftovers = 0
+    pre_dismissed = {}
 
     # Clear tmux scrollback so stale text from prior runs cannot poison _detect_auth_screen
     _auth_check(flow)
@@ -2434,10 +2483,8 @@ async def _run_auth_state_machine(pane: str, flow: "_AuthFlow" = None) -> dict:
         await nap(0.3)
 
         pane_state = await _pane_process_state(pane)
-        # Remember whether the Claude in this pane is the CIV's LIVE session
-        # (never ours to kill) or a /login instance this flow launched itself.
-        if retry_count == 0:
-            live_session_present = (pane_state == "claude")
+        # launched_pre_pids stays None unless THIS attempt launches `claude
+        # /login` into a shell; only then may a retry stop a Claude (ours).
         launched_pre_pids = None
         if pane_state == "claude":
             visible = await _capture_visible(pane)
@@ -2447,14 +2494,29 @@ async def _run_auth_state_machine(pane: str, flow: "_AuthFlow" = None) -> dict:
             leftover = _plan_auth_close(visible)
             if leftover is not None:
                 # A sign-in screen from an earlier, abandoned attempt is still
-                # open. Close it (ONE key) and look again; never type /login
-                # into it.
-                if closed_leftover:
-                    log("A sign-in screen is still open after closing it once — nothing typed")
-                    return stop(error="a sign-in screen is still open; nothing typed")
-                closed_leftover = True
+                # open (code prompt -> picker -> prompt can take a few). Close
+                # it ONE key at a time and look again; never type /login into it.
+                if closed_leftovers >= 3:
+                    log("A sign-in screen is still open after closing it 3 times — nothing typed")
+                    return stop(error=AUTH_STUCK_MESSAGE)
+                closed_leftovers += 1
                 log(f"Closing a sign-in screen left from an earlier attempt ({leftover})")
                 await keys(leftover)
+                await nap(1.0)
+                continue
+            # A startup dialog (MCP servers / trust / update) already open in
+            # the live session: dismiss it properly first. Typing "/login" +
+            # Enter into it would pick its default (e.g. silently disable the
+            # CIV's MCP server) (review round 2, #2).
+            pre = _active_blocker(visible)
+            if pre is not None:
+                n = pre_dismissed.get(pre, 0)
+                if n >= AUTH_BLOCKER_MAX_DISMISSALS:
+                    log(f"Dialog {pre} is still open after {n} tries — nothing typed")
+                    return stop(error=AUTH_STUCK_MESSAGE)
+                pre_dismissed[pre] = n + 1
+                acted = await _dismiss_auth_blocker(pane, pre, flow)
+                log(f"Open dialog before /login: {pre} ({'dismissed' if acted else 'nothing pressed'})")
                 await nap(1.0)
                 continue
         # Snapshot what is already on screen so stale sign-in text is ignored.
@@ -2488,6 +2550,11 @@ async def _run_auth_state_machine(pane: str, flow: "_AuthFlow" = None) -> dict:
             elapsed = time.time() - phase_start
 
             screen_type, screen_content = await _detect_auth_screen(pane, baseline)
+            if screen_type not in ('oauth_url', 'logged_in', 'unknown', 'empty', 'shell_prompt'):
+                # About to press a key: never into a session that is mid-turn.
+                if _session_is_busy(await _capture_visible(pane)):
+                    log("Your AI is in the middle of a turn — stopping, nothing more typed")
+                    return stop(busy=True, error=AUTH_BUSY_MESSAGE)
 
             if screen_type == 'oauth_url':
                 # Goal state — extract the NEW URL (never one left from before)
@@ -2591,6 +2658,12 @@ try:
     AUTH_REFRESH_GRACE_S = max(0, int(os.environ.get("PORTAL_AUTH_REFRESH_GRACE_S", "7200")))
 except ValueError:
     AUTH_REFRESH_GRACE_S = 7200
+# How long after the access token expired an IDLE AI (refresh token present,
+# no API auth failure seen) still reads signed in. Default 14 days.
+try:
+    AUTH_REFRESH_MAX_IDLE_S = max(3600, int(os.environ.get("PORTAL_AUTH_REFRESH_MAX_IDLE_S", str(14 * 86400))))
+except ValueError:
+    AUTH_REFRESH_MAX_IDLE_S = 14 * 86400
 _AUTH_FAILURE_PANE_RE = re.compile(
     r'OAuth (?:access )?token has expired|token has been revoked|Please run /login|'
     r'Login expired|Invalid API key|authentication_error|'
@@ -2614,7 +2687,7 @@ def _evaluate_claude_credentials(creds_path: Path, now_ms: int = None) -> dict:
     {authenticated, reason, expires_at, subscription, needs_live_check}."""
     now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
     out = {"authenticated": False, "reason": "", "expires_at": None,
-           "subscription": None, "needs_live_check": False}
+           "subscription": None, "needs_live_check": False, "account": None}
     try:
         creds = json.loads(Path(creds_path).read_text())
     except FileNotFoundError:
@@ -2629,6 +2702,11 @@ def _evaluate_claude_credentials(creds_path: Path, now_ms: int = None) -> dict:
         return out
     sub = oauth.get("subscriptionType")
     out["subscription"] = sub if isinstance(sub, str) else None
+    acct = oauth.get("account")
+    if isinstance(acct, dict):
+        acct = acct.get("email_address") or acct.get("emailAddress")
+    out["account"] = acct.strip() if (isinstance(acct, str) and acct.strip() and len(acct) <= 320
+                                      and "sk-ant-" not in acct) else None
     expires_at = oauth.get("expiresAt")
     if (isinstance(expires_at, bool) or not isinstance(expires_at, (int, float))
             or not math.isfinite(expires_at) or expires_at <= 0):
@@ -2652,6 +2730,12 @@ def _evaluate_claude_credentials(creds_path: Path, now_ms: int = None) -> dict:
     # Code refreshes it on its next model request. An idle CIV makes none, so
     # its file can show an access token hours or days old while it is fine.
     # The caller decides from evidence (an auth failure reported by the API).
+    if now_ms - expires_at > AUTH_REFRESH_MAX_IDLE_S * 1000:
+        # Not used for longer than any refresh grant is trusted to live:
+        # signed out (the owner reconnects once). Bounds the "idle is not
+        # signed out" rule so a revoked grant cannot read signed-in forever.
+        out["reason"] = "expired_refresh_too_old"
+        return out
     out["needs_live_check"] = True
     if now_ms - expires_at > AUTH_REFRESH_GRACE_S * 1000:
         out["reason"] = "expired_beyond_refresh_grace"
@@ -2767,7 +2851,17 @@ def _scan_transcript_tail_with_offset(path: Path):
 # each call re-read and parsed ~1.5 MB).
 
 
+_auth_evidence_lock = threading.Lock()
+
+
 def _scan_transcript_incremental(p: Path) -> dict:
+    # Status calls run this in worker threads; the per-file offset must only
+    # ever advance once per byte range (review round 2, #6).
+    with _auth_evidence_lock:
+        return _scan_transcript_incremental_locked(p)
+
+
+def _scan_transcript_incremental_locked(p: Path) -> dict:
     try:
         st = p.stat()
     except OSError:
@@ -2848,10 +2942,6 @@ def _decide_auth_with_evidence(ev: dict, evidence: dict, creds_mtime_ms):
     return True, "expired_refresh_pending", False
 
 
-def _pane_shows_auth_failure(pane_text: str) -> bool:
-    return bool(pane_text) and bool(_AUTH_FAILURE_PANE_RE.search(pane_text))
-
-
 def _engine_is_managed() -> bool:
     """True when the AI engine does not use a personal Claude login.
 
@@ -2877,37 +2967,38 @@ def _engine_is_managed() -> bool:
 # The Claude account the engine is signed in as, for the Status page's "Engine
 # account" row (restored in review round 2; it matters most right after a
 # Reconnect used to switch accounts). An e-mail / label only — never a token.
-_ACCOUNT_LABEL_TTL_S = 30.0
 _ACCOUNT_FILE_MAX_BYTES = 32 * 1024 * 1024
 _account_label_cache: dict = {}
 
 
-def _claude_account_label(oauth, creds_mtime_ms=None):
-    def clean(v):
-        if isinstance(v, str) and v.strip() and len(v.strip()) <= 320 and "sk-ant-" not in v:
-            return v.strip()
-        return None
-    if isinstance(oauth, dict):
-        acct = oauth.get("account")
-        label = clean(acct)
-        if label is None and isinstance(acct, dict):
-            label = clean(acct.get("email_address")) or clean(acct.get("emailAddress"))
-        if label:
-            return label
+def _claude_account_label(oauth_account=None):
+    """The account label: the credentials' own `account` field if present,
+    else ~/.claude.json oauthAccount.emailAddress. The big ~/.claude.json is
+    parsed only when its (mtime, size) changed; a failed parse (Claude Code
+    rewriting it) keeps the last good label instead of flickering to None."""
+    if oauth_account:
+        return oauth_account
     p = Path.home() / ".claude.json"
-    now = time.time()
-    cached = _account_label_cache.get("v")
-    if cached and cached[1] == creds_mtime_ms and now - cached[0] < _ACCOUNT_LABEL_TTL_S:
-        return cached[2]
-    label = None
     try:
-        if p.stat().st_size <= _ACCOUNT_FILE_MAX_BYTES:
-            oa = json.loads(p.read_text()).get("oauthAccount")
-            if isinstance(oa, dict):
-                label = clean(oa.get("emailAddress"))
+        st = p.stat()
+    except OSError:
+        return None
+    key = (str(p), st.st_mtime_ns, st.st_size)
+    cached = _account_label_cache.get("v")
+    if cached and cached[0] == key:
+        return cached[1]
+    if st.st_size > _ACCOUNT_FILE_MAX_BYTES:
+        return cached[1] if cached else None
+    try:
+        oa = json.loads(p.read_text()).get("oauthAccount")
     except Exception:
-        label = None
-    _account_label_cache["v"] = (now, creds_mtime_ms, label)
+        return cached[1] if cached else None
+    label = None
+    if isinstance(oa, dict):
+        v = oa.get("emailAddress")
+        if isinstance(v, str) and v.strip() and len(v) <= 320 and "sk-ant-" not in v:
+            label = v.strip()
+    _account_label_cache["v"] = (key, label)
     return label
 
 
@@ -2922,7 +3013,7 @@ async def api_claude_auth_status(request: Request) -> JSONResponse:
         return JSONResponse({"authenticated": True, "managed": True, "account": None,
                              "reason": "managed_engine", "expires_at": None, "subscription": None})
     try:
-        ev = _evaluate_claude_credentials(CREDENTIALS_FILE)
+        ev = await asyncio.to_thread(_evaluate_claude_credentials, CREDENTIALS_FILE)
         authenticated = ev["authenticated"]
         reason = ev["reason"]
         try:
@@ -2934,11 +3025,7 @@ async def api_claude_auth_status(request: Request) -> JSONResponse:
             authenticated, reason, _ = _decide_auth_with_evidence(ev, evidence, creds_mtime_ms)
         account = None
         if creds_mtime_ms is not None:
-            try:
-                oauth = json.loads(CREDENTIALS_FILE.read_text()).get("claudeAiOauth")
-            except Exception:
-                oauth = None
-            account = await asyncio.to_thread(_claude_account_label, oauth, creds_mtime_ms)
+            account = await asyncio.to_thread(_claude_account_label, ev.get("account"))
         return JSONResponse({
             "authenticated": bool(authenticated),
             "account": account,  # e-mail / label only; never a secret
@@ -2960,24 +3047,28 @@ async def api_claude_auth_start(request: Request) -> JSONResponse:
 
     This is a longer-running endpoint (up to ~60s) but returns WITH the URL
     when the flow completes successfully. Only ONE flow runs at a time; POST
-    /api/auth/close cancels it.
+    /api/auth/close cancels it (also when the Close arrives first: same
+    "attempt" id).
     """
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     global _captured_oauth_url, _auth_flow, _auth_code_submission
+    body = await _auth_body(request)
+    attempt = _attempt_id(body)
+    if attempt and attempt in _closed_attempts:
+        return JSONResponse({"started": False, "cancelled": True, "error": "sign-in cancelled"})
     if _auth_flow_running():
         return JSONResponse({"started": False, "in_progress": True,
                              "error": "A sign-in is already starting. Wait a moment, or close it and start again."})
-    pane = await _find_primary_pane_async()
-    if _auth_flow_running():  # re-check after the await
-        return JSONResponse({"started": False, "in_progress": True,
-                             "error": "A sign-in is already starting. Wait a moment, or close it and start again."})
-    flow = _AuthFlow(pane)
+    # Register BEFORE any await so a Close can always find (and cancel) it.
+    flow = _AuthFlow(None, attempt)
     _auth_flow = flow
     _captured_oauth_url = None
     _auth_code_submission = None
-    _save_portal_message(f"Auth flow v2 started — {get_tmux_session()} (pane {pane})", role="assistant")
     try:
+        pane = await _find_primary_pane_async()
+        flow.pane = pane
+        _save_portal_message(f"Auth flow v2 started — {get_tmux_session()} (pane {pane})", role="assistant")
         result = await _run_auth_state_machine(pane, flow)
         return JSONResponse(result)
     except _AuthCancelled:
@@ -3001,15 +3092,20 @@ async def api_claude_auth_prewarm(request: Request) -> JSONResponse:
     """
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    global _auth_prewarm_task
+    global _auth_prewarm_task, _auth_flow
     # Don't start if already prewarming
     if _auth_prewarm_task and not _auth_prewarm_task.done():
         return JSONResponse({"status": "already_prewarming"})
     if _auth_flow_running():
         return JSONResponse({"status": "skipped", "reason": "a sign-in flow is running"})
-    pane = await _find_primary_pane_async()
-    _save_portal_message("Pre-warming Claude for auth...", role="assistant")
+    # Holds the one-flow slot while it types, so Start and prewarm never both
+    # type into the pane (review round 2, #10).
+    flow = _AuthFlow(None, None)
+    _auth_flow = flow
     try:
+        pane = await _find_primary_pane_async()
+        flow.pane = pane
+        _save_portal_message("Pre-warming Claude for auth...", role="assistant")
         # Resize tmux
         await _run_subprocess_async(["tmux", "resize-window", "-t", pane, "-x", "500"])
         await asyncio.sleep(0.3)
@@ -3027,6 +3123,10 @@ async def api_claude_auth_prewarm(request: Request) -> JSONResponse:
         return JSONResponse({"status": "prewarming"})
     except Exception as e:
         return JSONResponse({"error": f"prewarm failed: {e}"}, status_code=500)
+    finally:
+        flow.finished.set()
+        if _auth_flow is flow:
+            _auth_flow = None
 
 
 # The code Claude's sign-in page shows is one token (letters, digits and a few
@@ -3088,10 +3188,7 @@ async def api_claude_auth_code(request: Request) -> JSONResponse:
             creds_mtime_ns = CREDENTIALS_FILE.stat().st_mtime_ns
         except OSError:
             creds_mtime_ns = None
-        _auth_code_submission = {
-            "pane": pane, "at": time.time(), "creds_mtime_ns": creds_mtime_ns,
-            "baseline": _auth_screen_baseline(await _capture_auth_screen(pane)),
-        }
+        _auth_code_submission = {"pane": pane, "at": time.time(), "creds_mtime_ns": creds_mtime_ns}
         _save_portal_message(f"Auth code submitted — injecting into {get_tmux_session()}...", role="assistant")
         r = await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "-l", code], check=True)
         if r is None:
@@ -3115,9 +3212,10 @@ async def api_claude_auth_verify(request: Request) -> JSONResponse:
     sub = _auth_code_submission
     if not sub:
         return JSONResponse({"confirmed": False, "state": "no_code_submitted"})
-    content = await _capture_auth_screen(sub["pane"])
-    pat = AUTH_SCREEN_PATTERNS['logged_in']
-    screen_ok = len(pat.findall(content or "")) > sub["baseline"]["counts"].get('logged_in', 0)
+    # The code was only typed while the paste prompt was ACTIVE, so an ACTIVE
+    # "Login successful … Press Enter" screen now is new by construction
+    # (window-independent: no counting of lines that may scroll away).
+    screen_ok = _plan_auth_close(await _capture_visible(sub["pane"])) == "Enter"
     try:
         mt = CREDENTIALS_FILE.stat().st_mtime_ns
     except OSError:
@@ -3183,6 +3281,10 @@ async def api_claude_auth_close(request: Request) -> JSONResponse:
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     global _captured_oauth_url, _auth_code_submission
+    attempt = _attempt_id(await _auth_body(request))
+    if attempt:
+        _closed_attempts.append(attempt)
+        del _closed_attempts[:-32]
     flow = _auth_flow
     stopped = False
     if flow is not None and not flow.finished.is_set():
@@ -3194,7 +3296,7 @@ async def api_claude_auth_close(request: Request) -> JSONResponse:
             stopped = False
     _captured_oauth_url = None
     _auth_code_submission = None
-    pane = flow.pane if flow is not None else await _find_primary_pane_async()
+    pane = (flow.pane if flow is not None else None) or await _find_primary_pane_async()
     try:
         if flow is not None and not flow.finished.is_set():
             return JSONResponse({"closed": False, "flow_stopped": False,
