@@ -37,7 +37,7 @@ def portal(tmp_path, monkeypatch):
     (tmp_path / "token").write_text(TOKEN)
     sys.modules.pop("portal_server", None)
     mod = importlib.import_module("portal_server")
-    mod._auth_turn_cache.clear()
+    getattr(mod, "_auth_turn_cache", {}).clear()
 
     typed = []
     real_run = subprocess.run
