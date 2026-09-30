@@ -258,3 +258,111 @@ def test_helper_kill_code_never_uses_pkill():
                ps._signin_helper_send):
         src = inspect.getsource(fn)
         assert "pkill" not in src and "_kill_claude_process" not in src, fn.__name__
+
+
+def test_login_process_counts_as_ai_once_signed_in(portal, monkeypatch):
+    """A `claude /login` that already has a valid sign-in is a working session."""
+    mod, home, _ = portal
+    monkeypatch.setattr(mod, "_claude_processes_sync", lambda: [os.getpid()])
+    monkeypatch.setattr(mod, "_proc_argv", lambda pid: ["claude", "/login"])
+    assert mod._ai_processes_sync() == []
+    (home / ".claude" / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": "a", "expiresAt": int(time.time() * 1000) + 3600_000}}))
+    assert mod._ai_processes_sync() == [os.getpid()]
+    monkeypatch.setattr(mod, "_proc_argv", lambda pid: ["claude", "auth", "login"])
+    assert mod._ai_processes_sync() == []      # the helper command exits after sign-in
+
+
+def test_live_session_ignores_the_helper_process(portal, monkeypatch):
+    mod, home, _ = portal
+    _expired(home)
+    mod.FIRST_BOOT_MARKER.write_text("1")
+    monkeypatch.setattr(mod, "_claude_processes_sync", lambda: [os.getpid()])
+    monkeypatch.setattr(mod, "_proc_argv", lambda pid: ["/x/claude", "auth", "login"])
+    s = TestClient(mod.app).get("/api/auth/status", headers=H).json()
+    assert s["live_session"] is False and s["signin_mode"] == "helper"
+
+
+def test_first_boot_still_fires_for_a_newborn_with_a_stray_claude(portal, monkeypatch):
+    """A newborn that has never worked keeps main's awakening even if some
+    Claude process is up (review r0 #1)."""
+    mod, home, calls = portal
+    monkeypatch.setattr(mod, "_claude_processes_sync", lambda: [os.getpid()])
+    monkeypatch.setattr(mod, "_proc_argv", lambda pid: ["claude", "--dangerously-skip-permissions"])
+    assert mod._signin_mode_sync() == "helper"          # sign-in goes through the helper
+    did = []
+
+    async def fake_async(cmd, timeout=5, check=False):
+        did.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    async def fake_kill():
+        did.append("kill")
+
+    async def primary():
+        return "%7"
+
+    async def no_claude(pane):
+        return False
+
+    async def fast_sleep(_s):
+        return None
+
+    monkeypatch.setattr(mod, "_run_subprocess_async", fake_async)
+    monkeypatch.setattr(mod, "_kill_claude_process", fake_kill)
+    monkeypatch.setattr(mod, "_find_primary_pane_async", primary)
+    monkeypatch.setattr(mod, "_is_claude_running_async", no_claude)
+    monkeypatch.setattr(mod.asyncio, "sleep", fast_sleep)
+    r = TestClient(mod.app).post("/api/evolution/first-boot", headers=H).json()
+    assert r["status"] == "fired" and mod.FIRST_BOOT_MARKER.exists() and "kill" in did
+
+
+def _helper_pane_fn(mod, pane_pid, dead=False):
+    async def fn():
+        return {"pane_id": "%9", "pane_pid": pane_pid, "dead": dead}
+    return fn
+
+
+def test_close_helper_never_signals_a_dead_pane_or_non_signin_root(portal, monkeypatch):
+    """Review r0 #2: a stale pane_pid may belong to another process now."""
+    mod, home, calls = portal
+    ai = subprocess.Popen(["bash", "-c", "exec -a claude sleep 30"])
+    try:
+        time.sleep(0.3)
+        async def no_primary():
+            return set()
+        monkeypatch.setattr(mod, "_primary_pane_pids", no_primary)
+        for dead in (True, False):   # dead pane; live pane whose root is an AI, not a sign-in
+            monkeypatch.setattr(mod, "_signin_helper_pane", _helper_pane_fn(mod, ai.pid, dead))
+            asyncio.run(mod._close_signin_helper("test"))   # os.kill is a hard failure in this fixture
+        assert ai.poll() is None
+    finally:
+        _REAL_KILL(ai.pid, 9)
+        ai.wait()
+
+
+def test_close_helper_kills_only_the_helper_tree(portal, monkeypatch):
+    mod, home, calls = portal
+    helper = subprocess.Popen(["bash", "-c", "exec -a claude sleep 30", "auth", "login"])
+    # argv of the helper root: make it read as `claude auth login`
+    other = subprocess.Popen(["bash", "-c", "exec -a claude sleep 30"])
+    killed = []
+    try:
+        time.sleep(0.3)
+        monkeypatch.setattr(mod, "_proc_argv", lambda pid: ["claude", "auth", "login"] if pid == helper.pid
+                            else (["claude"] if pid == other.pid else None))
+
+        async def no_primary():
+            return set()
+        monkeypatch.setattr(mod, "_primary_pane_pids", no_primary)
+        monkeypatch.setattr(mod, "_signin_helper_pane", _helper_pane_fn(mod, helper.pid))
+        monkeypatch.setattr(os, "kill", lambda pid, sig: (killed.append(pid), _REAL_KILL(pid, sig)))
+        asyncio.run(mod._close_signin_helper("test"))
+        assert killed and set(killed) == {helper.pid} and other.poll() is None
+    finally:
+        for p in (helper, other):
+            try:
+                _REAL_KILL(p.pid, 9)
+            except ProcessLookupError:
+                pass
+            p.wait()

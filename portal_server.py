@@ -233,7 +233,7 @@ async def _run_subprocess_async(cmd, timeout=5, check=False):
     This is the ONLY way subprocess should be called from async code."""
     if _newborn_flow_guard.get() and _is_send_keys(cmd):
         # t3383: inside the first sign-in flow, re-check before EVERY key.
-        _newborn_guard_check("key")
+        await _newborn_guard_check("key")
     loop = asyncio.get_event_loop()
     try:
         return await asyncio.wait_for(
@@ -1947,7 +1947,7 @@ async def _kill_claude_process() -> None:
     """Kill any running Claude process in this container."""
     if _newborn_flow_guard.get():
         # t3383: inside the first sign-in flow, re-check before EVERY kill.
-        _newborn_guard_check("kill")
+        await _newborn_guard_check("kill")
     await _run_subprocess_output(
         ["bash", "-c", "pkill -f 'claude' 2>/dev/null; pkill -f 'node.*claude' 2>/dev/null; true"],
         timeout=5,
@@ -2274,7 +2274,7 @@ async def _established_ai_running() -> bool:
     if not _civ_is_established():
         return False
     loop = asyncio.get_event_loop()
-    procs = await loop.run_in_executor(None, _claude_processes_sync)
+    procs = await loop.run_in_executor(None, _ai_processes_sync)
     return procs is None or len(procs) > 0
 
 
@@ -2330,19 +2330,35 @@ def _proc_argv(pid: int):
     return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
 
 
+def _credentials_unexpired() -> bool:
+    try:
+        oauth = json.loads(CREDENTIALS_FILE.read_text()).get("claudeAiOauth", {}) or {}
+    except Exception:
+        return False
+    return bool(oauth.get("accessToken")) and (oauth.get("expiresAt") or 0) > time.time() * 1000
+
+
 def _ai_processes_sync():
     """Claude processes that are a working AI: every Claude process except a
-    bare sign-in. An unreadable one counts as an AI. None = could not tell."""
+    bare sign-in. A `claude /login` that already has a valid sign-in is a
+    working session, so it counts. An unreadable one counts. None = could not
+    tell."""
     procs = _claude_processes_sync()
     if procs is None:
         return None
+    signed_in = None
     found = []
     for pid in procs:
         argv = _proc_argv(pid)
         if argv is None:
             continue
         if argv and _argv_is_signin_only(argv):
-            continue
+            if "/login" not in argv[1:]:
+                continue            # `claude auth login` exits after sign-in
+            if signed_in is None:
+                signed_in = _credentials_unexpired()
+            if not signed_in:
+                continue
         found.append(pid)
     return found
 
@@ -2403,10 +2419,11 @@ def _signin_mode_sync() -> str:
     return "newborn"
 
 
-def _newborn_guard_check(what: str) -> None:
+async def _newborn_guard_check(what: str) -> None:
     """Inside the first sign-in flow: stop before a key or a kill if the CIV
     is no longer a newborn with no AI running."""
-    if _signin_mode_sync() != "newborn":
+    loop = asyncio.get_event_loop()
+    if await loop.run_in_executor(None, _signin_mode_sync) != "newborn":
         raise _SigninGuardStop(f"{what}: an AI is running or this CIV is established")
 
 
@@ -2417,8 +2434,28 @@ def _signin_helper_lock() -> asyncio.Lock:
     return _signin_helper_lock_obj
 
 
+def _ppid(pid: int):
+    try:
+        st = Path(f"/proc/{pid}/stat").read_text()
+        return int(st[st.rindex(")") + 2:].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _is_under(pid: int, root: int) -> bool:
+    """pid is root, or root is one of its ancestors, right now."""
+    seen = 0
+    while pid and pid > 1 and seen < 64:
+        if pid == root:
+            return True
+        pid, seen = _ppid(pid), seen + 1
+    return False
+
+
 def _descendants_sync(root: int) -> set:
-    """root and every process under it (read from /proc)."""
+    """root and every process under it (read from /proc). Empty if root is gone."""
+    if not Path(f"/proc/{root}").exists():
+        return set()
     kids: dict = {}
     for d in Path("/proc").iterdir():
         if not d.name.isdigit():
@@ -2488,24 +2525,31 @@ async def _close_signin_helper(reason: str) -> bool:
         return False
     loop = asyncio.get_event_loop()
     root = hp["pane_pid"]
-    protected = (await _primary_pane_pids()) | {os.getpid()}
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        targets = await loop.run_in_executor(None, _descendants_sync, root)
-        targets -= protected
-        for pid in sorted(targets, reverse=True):
-            # Check again right before this kill.
-            if pid in protected or pid not in _descendants_sync(root):
-                continue
-            try:
-                os.kill(pid, sig)
-            except (ProcessLookupError, PermissionError):
-                pass
-        for _ in range(10):
-            await asyncio.sleep(0.2)
-            if not (_descendants_sync(root) - protected) or not Path(f"/proc/{root}").exists():
+    # Signal only a live helper whose own command is the sign-in (a dead pane's
+    # pane_pid may since belong to another process).
+    root_argv = _proc_argv(root) or []
+    if not hp["dead"] and root_argv and _argv_is_signin_only(root_argv):
+        protected = (await _primary_pane_pids()) | {os.getpid()}
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            targets = await loop.run_in_executor(None, _descendants_sync, root)
+            for pid in sorted(targets - protected, reverse=True):
+                # Check again right before this kill: still under the helper,
+                # not the AI's pane, and not a working Claude.
+                argv = _proc_argv(pid)
+                if pid in protected or not _is_under(pid, root) or argv is None:
+                    continue
+                if _argv_is_claude(argv) and not _argv_is_signin_only(argv):
+                    continue
+                try:
+                    os.kill(pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            for _ in range(10):
+                await asyncio.sleep(0.2)
+                if not Path(f"/proc/{root}").exists():
+                    break
+            if not Path(f"/proc/{root}").exists():
                 break
-        if not Path(f"/proc/{root}").exists():
-            break
     hp2 = await _signin_helper_pane()
     if hp2 is not None and hp2["pane_id"] == hp["pane_id"]:
         await _run_subprocess_async(["tmux", "kill-session", "-t", _SIGNIN_HELPER_TARGET])
@@ -2637,15 +2681,17 @@ async def _signin_helper_submit_code(code: str) -> dict:
         result = "pending"
         for _ in range(60):
             await asyncio.sleep(0.5)
+            hp = await _signin_helper_pane()
+            finished = hp is None or hp["dead"]
+            if not finished:
+                screen, _content = await _detect_auth_screen(hp["pane_id"])
+                finished = screen == "logged_in"
+            if not finished:
+                continue    # never stop the helper mid-exchange
             now_fp = _creds_fingerprint()
             changed = now_fp is not None and now_fp != before and now_fp[1] > time.time() * 1000
-            hp = await _signin_helper_pane()
-            if changed:
-                result = "signed_in"
-                break
-            if hp is None or hp["dead"]:
-                result = "failed"
-                break
+            result = "signed_in" if changed else "failed"
+            break
         if result == "signed_in":
             await asyncio.sleep(1.0)
             await _close_signin_helper("signed in")
@@ -2947,10 +2993,10 @@ async def api_evolution_first_boot(request: Request) -> JSONResponse:
         return JSONResponse({"status": "already_evolved"})
     if FIRST_BOOT_MARKER.exists():
         return JSONResponse({"status": "already_fired"})
-    # t3383: a CIV with no marker that has worked before, or has an AI
-    # running, is not a newborn: never stop its AI or type an awakening into it.
+    # t3383: a CIV with no marker whose primary has already worked is not a
+    # newborn: never stop its AI or type an awakening into it.
     loop = asyncio.get_event_loop()
-    if await loop.run_in_executor(None, _signin_mode_sync) != "newborn":
+    if await loop.run_in_executor(None, _primary_has_real_turn):
         return JSONResponse({"status": "skipped_not_newborn"})
     # Write marker before launching — prevents double-fire on concurrent calls
     try:

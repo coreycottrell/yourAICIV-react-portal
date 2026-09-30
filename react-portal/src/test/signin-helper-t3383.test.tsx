@@ -27,7 +27,7 @@ afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers() })
 const URL = 'https://claude.ai/oauth/authorize?code=true&state=helper1'
 
 describe('sign-in through the helper window (t3383)', () => {
-  it('established CIV: signs in via the helper and never fires first boot', async () => {
+  it('established CIV with a running AI: signs in via the helper; first boot left to the server', async () => {
     statuses = [
       { authenticated: false, live_session: true, signin_mode: 'helper' },
       { authenticated: false, live_session: true, signin_mode: 'helper' },
@@ -41,9 +41,9 @@ describe('sign-in through the helper window (t3383)', () => {
     fireEvent.change(screen.getByPlaceholderText('eyJh...'), { target: { value: 'abc#def' } })
     fireEvent.click(screen.getByText('Submit'))
     await waitFor(() => expect(screen.queryByText('Reconnect Claude')).not.toBeInTheDocument(), { timeout: 10000 })
-    expect(calls).not.toContain('POST /api/evolution/first-boot')
     expect(calls).not.toContain('GET /api/auth/url')
-    expect(calls.filter(c => c.startsWith('POST'))).toEqual(['POST /api/auth/start', 'POST /api/auth/code'])
+    // first boot is called as on main; the server returns already_evolved / skipped for a non-newborn
+    expect(calls.filter(c => c.startsWith('POST'))).toEqual(['POST /api/auth/start', 'POST /api/auth/code', 'POST /api/evolution/first-boot'])
   }, 15000)
 
   it('a failed helper code shows an error and offers a fresh sign-in', async () => {
@@ -58,7 +58,7 @@ describe('sign-in through the helper window (t3383)', () => {
     expect(screen.getByText('Sign in')).toBeInTheDocument()
   }, 15000)
 
-  it('click-time re-check: page loaded as newborn, an AI started since -> helper, no first boot', async () => {
+  it('click-time re-check: page loaded as newborn, an AI started since -> helper path', async () => {
     statuses = [
       { authenticated: false, live_session: false },
       { authenticated: false, live_session: true, signin_mode: 'helper' },
@@ -73,7 +73,24 @@ describe('sign-in through the helper window (t3383)', () => {
     fireEvent.change(await screen.findByPlaceholderText('eyJh...'), { target: { value: 'abc' } })
     fireEvent.click(screen.getByText('Submit'))
     await waitFor(() => expect(screen.queryByText('Reconnect Claude')).not.toBeInTheDocument(), { timeout: 10000 })
-    expect(calls).not.toContain('POST /api/evolution/first-boot')
+    expect(calls).not.toContain('GET /api/auth/url')
+  }, 15000)
+
+  it('established CIV whose AI was not running: signed in, then a plain note says so', async () => {
+    statuses = [
+      { authenticated: false, live_session: false, signin_mode: 'helper' },
+      { authenticated: false, live_session: false, signin_mode: 'helper' },
+      { authenticated: true },
+    ]
+    startBody = { started: true, url: URL, mode: 'helper' }
+    codeBody = { injected: true, mode: 'helper', result: 'signed_in' }
+    render(<ClaudeAuthFlow />)
+    fireEvent.click(await screen.findByText('Sign in'))
+    fireEvent.change(await screen.findByPlaceholderText('eyJh...'), { target: { value: 'abc' } })
+    fireEvent.click(screen.getByText('Submit'))
+    expect(await screen.findByText(/wasn't running/, {}, { timeout: 10000 })).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Close'))
+    await waitFor(() => expect(screen.queryByText(/wasn't running/)).not.toBeInTheDocument())
   }, 15000)
 
   it('newborn: main path, URL polled, first boot fired after sign-in', async () => {

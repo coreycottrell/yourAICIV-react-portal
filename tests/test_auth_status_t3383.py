@@ -284,6 +284,8 @@ def test_newborn_never_flagged_live(portal, monkeypatch):
 
 def test_established_civ_with_claude_running_flagged_live(portal, monkeypatch):
     mod, home, _ = portal
+    # t3383 helper: live = a working AI (argv), not a bare sign-in
+    monkeypatch.setattr(mod, "_proc_argv", lambda pid: ["claude", "--dangerously-skip-permissions"])
     mod.FIRST_BOOT_MARKER.write_text("1")
     monkeypatch.setattr(mod, "_claude_processes_sync", lambda: [123])
     assert _status(mod)["live_session"] is True
@@ -295,6 +297,8 @@ def test_established_civ_with_claude_running_flagged_live(portal, monkeypatch):
 
 def test_evolution_done_marker_alone_counts_as_established(portal, monkeypatch):
     mod, home, _ = portal
+    # t3383 helper: live = a working AI (argv), not a bare sign-in
+    monkeypatch.setattr(mod, "_proc_argv", lambda pid: ["claude", "--dangerously-skip-permissions"])
     mod.EVOLUTION_DONE_MARKER.parent.mkdir(parents=True, exist_ok=True)
     mod.EVOLUTION_DONE_MARKER.touch()
     monkeypatch.setattr(mod, "_claude_processes_sync", lambda: [123])

@@ -103,26 +103,21 @@ export function ClaudeAuthFlow() {
     setStep('starting')
     try {
       // Check again at the click: the page may have loaded before an AI started.
-      let helper = helperMode
       try {
         const now = await apiGet<AuthStatusResponse>('/api/auth/status')
         if (now.authenticated) {
           setAuthenticated(true)
           return
         }
-        if (now.signin_mode === 'helper') {
-          helper = true
-          setHelperMode(true)
-        }
+        if (now.signin_mode === 'helper') setHelperMode(true)
         if (now.live_session) setLive(true)
       } catch {
         // The server decides the sign-in path again itself.
       }
       const res = await apiPost<StartResponse>('/api/auth/start')
-      if (res.mode === 'helper') {
-        helper = true
-        setHelperMode(true)
-      }
+      // The server decided the path at the click; follow it.
+      const helper = res.mode === 'helper'
+      setHelperMode(helper)
       if (res.error) {
         setError(res.error)
         setStep('idle')
@@ -156,7 +151,7 @@ export function ClaudeAuthFlow() {
       setError(err instanceof Error ? err.message : 'Failed to start authentication')
       setStep('idle')
     }
-  }, [helperMode])
+  }, [])
 
   const handleSubmitCode = useCallback(async () => {
     if (!code.trim()) return
@@ -191,9 +186,13 @@ export function ClaudeAuthFlow() {
               // Auth confirmed — fire evolution and dismiss immediately.
               // Do NOT wait for evolution to complete (takes 10+ min).
               // Human watches evolution in terminal/chat.
-              // Newborn only: an established CIV's AI keeps running and picks
-              // up the new sign-in itself.
-              if (!helper) fireFirstBoot().catch(() => {})
+              // The server fires it only for a newborn (t3383).
+              fireFirstBoot().catch(() => {})
+              if (helper && !statusRes.live_session && !live) {
+                // Signed in, but no AI was running to pick it up: say so.
+                setStep('success')
+                return
+              }
               setAuthenticated(true)
             }
           } catch {
@@ -205,7 +204,7 @@ export function ClaudeAuthFlow() {
       setError(err instanceof Error ? err.message : 'Failed to submit code')
       setStep('url-ready')
     }
-  }, [code, helperMode])
+  }, [code, helperMode, live])
 
   const handleClose = useCallback(() => {
     clearPolls()
@@ -224,7 +223,19 @@ export function ClaudeAuthFlow() {
     <div className="claude-auth-overlay">
       <div className="claude-auth-box">
         {step === 'success' ? (
-          <div className="claude-auth-success">{'\u2705'} Claude authenticated successfully!</div>
+          <>
+            <div className="claude-auth-success">{'\u2705'} Claude authenticated successfully!</div>
+            <div className="claude-auth-note">
+              Your AI wasn't running when you signed in. If it doesn't answer you in a few
+              minutes, contact support and we'll start it for you.
+            </div>
+            {SUPPORT_URL && (
+              <a className="claude-auth-link-inline" href={SUPPORT_URL} target="_blank" rel="noopener noreferrer">
+                {SUPPORT_LABEL}
+              </a>
+            )}
+            <button className="claude-auth-btn" onClick={() => setAuthenticated(true)}>Close</button>
+          </>
         ) : (
           <>
             <div className="claude-auth-icon">{'\uD83D\uDD10'}</div>
