@@ -22,6 +22,7 @@ from starlette.testclient import TestClient
 TOKEN = "test-token"
 H = {"Authorization": f"Bearer {TOKEN}"}
 _REAL_RUN = subprocess.run
+_REAL_KILL = os.kill  # the test's own sleep processes only
 
 
 @pytest.fixture()
@@ -38,6 +39,10 @@ def portal(tmp_path, monkeypatch):
     sys.modules.pop("portal_server", None)
     mod = importlib.import_module("portal_server")
     getattr(mod, "_auth_turn_cache", {}).clear()
+    if hasattr(mod, "_claude_processes_sync"):
+        mod._claude_processes_sync_orig = mod._claude_processes_sync
+        # Tests never see the host's real Claude processes unless they ask.
+        mod._claude_processes_sync = lambda: []
 
     typed = []
     real_run = subprocess.run
@@ -233,7 +238,7 @@ def test_large_transcript_only_tail_is_read(portal):
 
 def test_newborn_never_flagged_live(portal, monkeypatch):
     mod, home, _ = portal
-    monkeypatch.setattr(mod, "_tmux_runs_live_claude_sync", lambda: True)
+    monkeypatch.setattr(mod, "_working_ai_running_sync", lambda fresh=False: True)
     s = _status(mod)
     assert s["authenticated"] is False and s["live_session"] is False
 
@@ -241,53 +246,54 @@ def test_newborn_never_flagged_live(portal, monkeypatch):
 def test_established_civ_with_claude_running_flagged_live(portal, monkeypatch):
     mod, home, _ = portal
     mod.FIRST_BOOT_MARKER.write_text("1")
-    monkeypatch.setattr(mod, "_tmux_runs_live_claude_sync", lambda: True)
+    monkeypatch.setattr(mod, "_working_ai_running_sync", lambda fresh=False: True)
     assert _status(mod)["live_session"] is True
-    monkeypatch.setattr(mod, "_tmux_runs_live_claude_sync", lambda: None)
+    monkeypatch.setattr(mod, "_working_ai_running_sync", lambda fresh=False: None)
     assert _status(mod)["live_session"] is True  # cannot tell -> treat as live
-    monkeypatch.setattr(mod, "_tmux_runs_live_claude_sync", lambda: False)
+    monkeypatch.setattr(mod, "_working_ai_running_sync", lambda fresh=False: False)
     assert _status(mod)["live_session"] is False
 
 
-def test_session_detection_reads_only(portal, monkeypatch):
-    """Real detection against a real PRIVATE tmux server: finds a process whose
-    argv[0] is 'claude' in any pane, ignores a young `claude /login` sign-in
-    instance, and never types into a pane."""
+def test_process_detection_reads_only_and_exempts_the_signin_flow(portal, monkeypatch):
+    """Real /proc scan: finds a process whose argv[0] is 'claude' anywhere
+    (not only in tmux); a Claude started after an allowed sign-in flow began is
+    exempt until the sign-in succeeds; nothing is signalled."""
     mod, home, typed = portal
-    import shutil
-    if not shutil.which("tmux"):
-        pytest.skip("tmux not installed")
-    sock = str(home / "t.sock")
+    mine = [p for p, _ in (mod._claude_processes_sync_orig() or [])]  # host's own, ignored
 
-    def run_private(cmd, *a, **kw):
-        if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "tmux":
-            if "send-keys" in cmd:
-                typed.append(" ".join(cmd))
-                raise AssertionError("typed")
-            cmd = ["tmux", "-S", sock] + list(cmd[1:])
-        return _REAL_RUN(cmd, *a, **kw)
-
-    monkeypatch.setattr(mod.subprocess, "run", run_private)
-    env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
-    assert mod._tmux_runs_live_claude_sync() is False  # no server at all
-    _REAL_RUN(["tmux", "-S", sock, "new-session", "-d", "-s", "sbx-primary", "bash --norc --noprofile"], env=env, check=True)
+    def only_test_procs():
+        procs = _REAL_CLAUDE_SCAN(mod)
+        return [(p, s) for p, s in procs if p not in mine]
+    monkeypatch.setattr(mod, "_claude_processes_sync", only_test_procs)
+    assert mod._working_ai_running_sync(fresh=True) is False
+    ai = _REAL_POPEN(["bash", "-c", "exec -a claude sleep 30"])
     try:
-        assert mod._tmux_runs_live_claude_sync() is False
-        _REAL_RUN(["tmux", "-S", sock, "new-window", "-t", "sbx-primary",
-                   "exec -a claude python3 -c 'import time; time.sleep(30)' /login"], env=env, check=True)
-        time.sleep(0.5)
-        assert mod._tmux_runs_live_claude_sync() is False  # young sign-in instance
-        monkeypatch.setattr(mod, "_SIGNIN_INSTANCE_MAX_AGE_S", 0)
-        assert mod._tmux_runs_live_claude_sync() is True   # an old /login instance is the AI now
-        monkeypatch.setattr(mod, "_SIGNIN_INSTANCE_MAX_AGE_S", 1200)
-        # a working AI in another session (not the attached/primary one)
-        _REAL_RUN(["tmux", "-S", sock, "new-session", "-d", "-s", "teammate",
-                   "exec -a claude sleep 30"], env=env, check=True)
-        time.sleep(0.5)
-        assert mod._tmux_runs_live_claude_sync() is True
+        time.sleep(0.3)
+        assert mod._working_ai_running_sync(fresh=True) is True
+        # a sign-in flow that started AFTER the AI does not exempt it
+        monkeypatch.setattr(mod, "_signin_flow_started_at", time.time())
+        assert mod._working_ai_running_sync(fresh=True) is True
     finally:
-        _REAL_RUN(["tmux", "-S", sock, "kill-server"], env=env)
+        _REAL_KILL(ai.pid, 9); ai.wait()
+    monkeypatch.setattr(mod, "_signin_flow_started_at", time.time() - 1)
+    helper = _REAL_POPEN(["bash", "-c", "exec -a claude sleep 30"])  # started after the flow began
+    try:
+        time.sleep(0.3)
+        assert mod._working_ai_running_sync(fresh=True) is False  # the flow's own claude /login
+        mod._signed_in_done({})                                     # sign-in succeeded
+        assert mod._working_ai_running_sync(fresh=True) is True   # now it is the working AI
+        monkeypatch.setattr(mod, "_signin_flow_started_at", time.time() - 3600)
+        assert mod._working_ai_running_sync(fresh=True) is True   # stale flow window
+    finally:
+        _REAL_KILL(helper.pid, 9); helper.wait()
     assert typed == []
+
+
+_REAL_POPEN = subprocess.Popen
+
+
+def _REAL_CLAUDE_SCAN(mod):
+    return [x for x in (mod.__dict__["_claude_processes_sync_orig"]() or [])]
 
 
 def test_argv_is_claude():
@@ -355,8 +361,8 @@ def test_new_code_has_no_key_or_kill_paths():
     sys.modules.pop("portal_server", None)
     import portal_server as ps
     for fn in (ps._claude_auth_status_payload, ps.api_claude_auth_status, ps.api_claude_auth_reconnect,
-               ps._tmux_runs_live_claude_sync, ps._primary_turn_after, ps._file_turn_after,
-               ps._established_ai_running, ps._is_signin_instance):
+               ps._working_ai_running_sync, ps._claude_processes_sync, ps._primary_turn_after,
+               ps._file_turn_after, ps._established_ai_running):
         src = inspect.getsource(fn)
         for bad in ("send-keys", "pkill", "os.kill", "_kill_claude_process", "signal.", "restart"):
             assert bad not in src, (fn.__name__, bad)
@@ -370,7 +376,7 @@ def test_reconnect_held_while_established_ai_runs(portal, monkeypatch):
     original = (home / ".claude" / ".credentials.json").read_text()
     c = TestClient(mod.app)
     for running in (True, None):
-        monkeypatch.setattr(mod, "_tmux_runs_live_claude_sync", lambda r=running: r)
+        monkeypatch.setattr(mod, "_working_ai_running_sync", lambda fresh=False, r=running: r)
         body = c.post("/api/auth/reconnect", headers=H).json()
         assert body["reconnect"] == {"moved": False, "backup": None, "held": "live_session"}
         assert body["live_session"] is True
@@ -384,7 +390,7 @@ def test_reconnect_moves_for_newborn_even_if_claude_runs(portal, monkeypatch):
     """A newborn mid-sign-in (claude /login in the pane) is not an established AI."""
     mod, home, _ = portal
     _creds(home, accessToken="a")
-    monkeypatch.setattr(mod, "_tmux_runs_live_claude_sync", lambda: True)
+    monkeypatch.setattr(mod, "_working_ai_running_sync", lambda fresh=False: True)
     body = TestClient(mod.app).post("/api/auth/reconnect", headers=H).json()
     assert body["reconnect"]["moved"] is True
 
@@ -400,7 +406,7 @@ def test_signin_flow_refuses_over_a_working_ai(portal, monkeypatch):
         raise AssertionError(f"touched tmux: {cmd}")
     monkeypatch.setattr(mod, "_run_subprocess_async", fake_async)
     mod.FIRST_BOOT_MARKER.write_text("1")
-    monkeypatch.setattr(mod, "_tmux_runs_live_claude_sync", lambda: True)
+    monkeypatch.setattr(mod, "_working_ai_running_sync", lambda fresh=False: True)
     c = TestClient(mod.app)
     for path in ("/api/auth/start", "/api/auth/prewarm"):
         body = c.post(path, headers=H).json()
@@ -410,7 +416,7 @@ def test_signin_flow_refuses_over_a_working_ai(portal, monkeypatch):
 
 def test_signin_flow_unchanged_for_newborn(portal, monkeypatch):
     mod, home, _ = portal
-    monkeypatch.setattr(mod, "_tmux_runs_live_claude_sync", lambda: True)
+    monkeypatch.setattr(mod, "_working_ai_running_sync", lambda fresh=False: True)
     called = []
 
     async def fake_machine(pane):
@@ -423,3 +429,77 @@ def test_signin_flow_unchanged_for_newborn(portal, monkeypatch):
     monkeypatch.setattr(mod, "_find_primary_pane_async", pane)
     body = TestClient(mod.app).post("/api/auth/start", headers=H).json()
     assert body["started"] is True and called == ["%0"]
+
+
+def test_auth_error_after_last_turn_reads_signed_out(portal):
+    mod, home, _ = portal
+    exp = _now_ms() - 3600_000
+    _creds(home, accessToken="a", refreshToken="r", expiresAt=exp)
+    err = _turn(exp + 120_000, isApiErrorMessage=True, error="authentication_failed")
+    err["message"]["model"] = "<synthetic>"
+    _write_transcript(_primary_dir(home), "primary.jsonl", [_turn(exp + 60_000), err])
+    s = _status(mod)
+    assert s["authenticated"] is False and s["reason"] == "expired_no_activity_since"
+    # a real turn AFTER the failure (refresh worked again) reads signed in
+    mod._auth_turn_cache.clear()
+    _write_transcript(_primary_dir(home), "primary.jsonl", [_turn(exp + 60_000), err, _turn(exp + 180_000)])
+    assert _status(mod)["authenticated"] is True
+
+
+def test_newest_transcript_decides(portal):
+    mod, home, _ = portal
+    exp = _now_ms() - 3600_000
+    _creds(home, accessToken="a", refreshToken="r", expiresAt=exp)
+    err = _turn(exp + 600_000, isApiErrorMessage=True, error="authentication_failed")
+    err["message"]["model"] = "<synthetic>"
+    _write_transcript(_primary_dir(home), "old.jsonl", [_turn(exp + 60_000)], mtime_ms=exp + 60_000)
+    _write_transcript(_primary_dir(home), "new.jsonl", [err], mtime_ms=exp + 600_000)
+    assert _status(mod)["authenticated"] is False
+
+
+def test_code_refused_over_a_working_ai_but_allowed_for_the_flows_own_login(portal, monkeypatch):
+    mod, home, typed = portal
+    mod.FIRST_BOOT_MARKER.write_text("1")
+    sent = []
+
+    async def fake_async(cmd, timeout=5, check=False):
+        sent.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, None, None)
+    monkeypatch.setattr(mod, "_run_subprocess_async", fake_async)
+
+    async def pane():
+        return "%0"
+    monkeypatch.setattr(mod, "_find_primary_pane_async", pane)
+    c = TestClient(mod.app)
+    # a working AI started before any sign-in flow: refused, nothing typed
+    monkeypatch.setattr(mod, "_claude_processes_sync", lambda: [(4242, time.time() - 600)])
+    body = c.post("/api/auth/code", headers=H, json={"code": "abc#def"}).json()
+    assert body.get("live_session") is True and "error" in body and sent == []
+    # the flow's own claude /login (started after the flow began): allowed
+    monkeypatch.setattr(mod, "_signin_flow_started_at", time.time() - 5)
+    monkeypatch.setattr(mod, "_claude_processes_sync", lambda: [(4243, time.time() - 2)])
+    body = c.post("/api/auth/code", headers=H, json={"code": "abc#def"}).json()
+    assert body.get("injected") is True and any("abc#def" in x for x in map(" ".join, sent))
+
+
+def test_start_records_the_flow_only_when_allowed(portal, monkeypatch):
+    mod, home, _ = portal
+    mod.FIRST_BOOT_MARKER.write_text("1")
+
+    async def fake_machine(pane):
+        return {"started": True}
+    monkeypatch.setattr(mod, "_run_auth_state_machine", fake_machine)
+
+    async def pane():
+        return "%0"
+    monkeypatch.setattr(mod, "_find_primary_pane_async", pane)
+    monkeypatch.setattr(mod, "_claude_processes_sync", lambda: [(1, time.time() - 600)])
+    c = TestClient(mod.app)
+    assert c.post("/api/auth/start", headers=H).json()["started"] is False
+    assert mod._signin_flow_started_at is None
+    monkeypatch.setattr(mod, "_claude_processes_sync", lambda: [])
+    assert c.post("/api/auth/start", headers=H).json()["started"] is True
+    assert mod._signin_flow_started_at is not None
+    _creds(home, accessToken="a", expiresAt=_now_ms() + 3600_000)
+    assert _status(mod)["authenticated"] is True
+    assert mod._signin_flow_started_at is None  # sign-in done: its claude is the AI now

@@ -2090,7 +2090,7 @@ def _primary_project_dir() -> Path:
     return _PROJECTS_DIR / re.sub(r"[^A-Za-z0-9]", "-", str(Path.home()))
 
 
-def _iso_to_ms(ts) -> int | None:
+def _iso_to_ms(ts):
     if not isinstance(ts, str) or not ts:
         return None
     try:
@@ -2120,18 +2120,36 @@ def _is_real_primary_turn(entry: dict) -> bool:
     return isinstance(model, str) and bool(model) and model != "<synthetic>"
 
 
-def _file_turn_after(path: Path, after_ms: int) -> bool:
-    """True if the transcript has a real primary turn stamped after after_ms.
+_AUTH_ERROR_TEXT = re.compile(r"\b401\b|/login|oauth|authenticat", re.IGNORECASE)
+
+
+def _is_auth_error_turn(entry: dict) -> bool:
+    """An API error placeholder that says the sign-in failed."""
+    if entry.get("type") != "assistant" or not entry.get("isApiErrorMessage"):
+        return False
+    if "auth" in str(entry.get("error") or "").lower():
+        return True
+    msg = entry.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    text = json.dumps(content) if content is not None else ""
+    return bool(_AUTH_ERROR_TEXT.search(text))
+
+
+def _file_turn_after(path: Path, after_ms: int):
+    """Newest sign-in evidence after after_ms in one transcript:
+    True  = a real primary turn (and no sign-in failure after it),
+    False = a sign-in failure after the last real turn,
+    None  = nothing after after_ms.
     Reads the end of the file only, widening the window until it reaches an
     entry older than after_ms (transcripts are append-only, oldest first)."""
     try:
         st = path.stat()
     except OSError:
-        return False
+        return None
     key = (str(path), st.st_mtime_ns, st.st_size, after_ms)
     if key in _auth_turn_cache:
         return _auth_turn_cache[key]
-    result = False
+    result = None
     try:
         with path.open("rb") as f:
             for window in _AUTH_SCAN_WINDOWS:
@@ -2154,6 +2172,11 @@ def _file_turn_after(path: Path, after_ms: int) -> bool:
                     if ts <= after_ms:
                         decided = True
                         break
+                    if _is_auth_error_turn(entry) and entry.get("entrypoint") in (None, "cli") \
+                            and not entry.get("isSidechain"):
+                        result = False
+                        decided = True
+                        break
                     if _is_real_primary_turn(entry):
                         result = True
                         decided = True
@@ -2161,7 +2184,7 @@ def _file_turn_after(path: Path, after_ms: int) -> bool:
                 if decided or start == 0:
                     break
     except OSError:
-        result = False
+        result = None
     if len(_auth_turn_cache) > 64:
         _auth_turn_cache.clear()
     _auth_turn_cache[key] = result
@@ -2169,8 +2192,9 @@ def _file_turn_after(path: Path, after_ms: int) -> bool:
 
 
 def _primary_turn_after(after_ms: int) -> bool:
-    """True if the primary session's own transcripts hold a real turn made
-    after after_ms. Only top-level *.jsonl in the primary project dir."""
+    """True if the primary session's own transcripts show a real turn made
+    after after_ms with no sign-in failure after it. Only top-level *.jsonl
+    in the primary project dir; the newest file with evidence decides."""
     proj = _primary_project_dir()
     try:
         files = []
@@ -2184,7 +2208,11 @@ def _primary_turn_after(after_ms: int) -> bool:
     except OSError:
         return False
     files.sort(key=lambda x: x[0], reverse=True)
-    return any(_file_turn_after(jf, after_ms) for _, jf in files[:_AUTH_SCAN_MAX_FILES])
+    for _, jf in files[:_AUTH_SCAN_MAX_FILES]:
+        found = _file_turn_after(jf, after_ms)
+        if found is not None:
+            return found
+    return False
 
 
 def _argv_is_claude(argv: list) -> bool:
@@ -2197,82 +2225,78 @@ def _argv_is_claude(argv: list) -> bool:
     return False
 
 
-_SIGNIN_INSTANCE_MAX_AGE_S = 20 * 60
+# A sign-in flow the guard allowed to start (epoch seconds). Claude processes
+# started after it are that flow's own `claude /login`, until the sign-in
+# succeeds (status reads signed in) or the window ends.
+_signin_flow_started_at = None
+_SIGNIN_FLOW_MAX_S = 20 * 60
+_PROC_SCAN_TTL_S = 5.0
+_proc_scan_cache: tuple = (0.0, None)
 
 
-def _process_age_s(pid: int) -> float | None:
+def _boot_epoch():
+    # /proc/uptime has 1/100 s precision (btime in /proc/stat only whole seconds)
+    return time.time() - float(Path("/proc/uptime").read_text().split()[0])
+
+
+def _claude_processes_sync():
+    """[(pid, start_epoch)] for every Claude process this user runs anywhere
+    in the container (the old sign-in flow's retry stops all of them).
+    Read only (/proc). None = could not tell."""
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-        start_ticks = int(stat[stat.rindex(")") + 2:].split()[19])
-        uptime = float(Path("/proc/uptime").read_text().split()[0])
-        return uptime - start_ticks / os.sysconf("SC_CLK_TCK")
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-def _is_signin_instance(pid: int, argv: list) -> bool:
-    """A `claude /login` the sign-in flow started, still within its sign-in
-    window. An older one has become the working AI (after a sign-in with no
-    first boot), so it counts as live again."""
-    if "/login" not in argv[1:]:
-        return False
-    age = _process_age_s(pid)
-    return age is not None and age < _SIGNIN_INSTANCE_MAX_AGE_S
-
-
-def _tmux_runs_live_claude_sync() -> bool | None:
-    """Is a working Claude (not a `claude /login` sign-in instance) running in
-    ANY pane of this user's tmux server? Read only: `tmux list-panes -a` and
-    /proc. All panes, not just the primary one, because the old sign-in
-    flow's retry stops every Claude process. None = could not tell."""
-    try:
-        r = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_pid}"],
-                           capture_output=True, text=True, timeout=3)
-        if r.returncode != 0:
-            err = (r.stderr or "").lower()
-            if "no server running" in err or "error connecting" in err:
-                return False  # no tmux server: nothing runs in a pane
-            return None
-        roots = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
-        if not roots:
-            return False
-        children: dict = {}
+        uid = os.getuid()
+        boot = _boot_epoch()
+        tick = os.sysconf("SC_CLK_TCK")
+        found = []
         for d in Path("/proc").iterdir():
             if not d.name.isdigit():
                 continue
             try:
+                if d.stat().st_uid != uid:
+                    continue
+                argv = [a.decode("utf-8", "replace")
+                        for a in (d / "cmdline").read_bytes().split(b"\0") if a]
+                if not _argv_is_claude(argv):
+                    continue
                 stat = (d / "stat").read_text()
-                ppid = int(stat[stat.rindex(")") + 2:].split()[1])
+                start = boot + int(stat[stat.rindex(")") + 2:].split()[19]) / tick
             except (OSError, ValueError, IndexError):
                 continue
-            children.setdefault(ppid, []).append(int(d.name))
-        seen = set()
-        stack = list(roots)
-        while stack:
-            pid = stack.pop()
-            if pid in seen:
-                continue
-            seen.add(pid)
-            try:
-                argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-                argv = [a.decode("utf-8", "replace") for a in argv if a]
-            except OSError:
-                argv = []
-            if _argv_is_claude(argv) and not _is_signin_instance(pid, argv):
-                return True
-            stack.extend(children.get(pid, []))
-        return False
+            found.append((int(d.name), start))
+        return found
     except Exception:
         return None
 
 
-async def _established_ai_running() -> bool:
-    """True when this CIV is established and a working Claude runs in tmux
-    (or that cannot be told). Always False for a newborn."""
+def _working_ai_running_sync(fresh: bool = False):
+    """True if a Claude process runs that is not the in-progress sign-in
+    flow's own `claude /login`. None = could not tell. Read only."""
+    global _proc_scan_cache
+    now = time.time()
+    if not fresh and now - _proc_scan_cache[0] < _PROC_SCAN_TTL_S and _proc_scan_cache[1] is not None:
+        procs = _proc_scan_cache[1]
+    else:
+        procs = _claude_processes_sync()
+        _proc_scan_cache = (now, procs)
+    if procs is None:
+        return None
+    flow = _signin_flow_started_at
+    if flow is not None and now - flow > _SIGNIN_FLOW_MAX_S:
+        flow = None
+    for _pid, started in procs:
+        if flow is not None and started > flow:
+            continue  # launched by the sign-in flow now in progress
+        return True
+    return False
+
+
+async def _established_ai_running(fresh: bool = False) -> bool:
+    """True when this CIV is established and a working Claude runs (or that
+    cannot be told). Always False for a newborn."""
     if not _civ_is_established():
         return False
     loop = asyncio.get_event_loop()
-    running = await loop.run_in_executor(None, _tmux_runs_live_claude_sync)
+    running = await loop.run_in_executor(None, _working_ai_running_sync, fresh)
     return running is not False
 
 
@@ -2284,6 +2308,14 @@ def _civ_is_established() -> bool:
     """First sign-in already happened here (first boot fired or evolution done).
     A newborn has neither marker, so its sign-in path is never changed."""
     return FIRST_BOOT_MARKER.exists() or EVOLUTION_DONE_MARKER.exists()
+
+
+def _signed_in_done(payload: dict) -> dict:
+    """Signed in: a sign-in flow in progress is over, so its `claude /login`
+    is the working AI from now on."""
+    global _signin_flow_started_at
+    _signin_flow_started_at = None
+    return payload
 
 
 async def _claude_auth_status_payload() -> dict:
@@ -2316,16 +2348,16 @@ async def _claude_auth_status_payload() -> dict:
                               "expires_at": expires_at}
                 now_ms = int(time.time() * 1000)
                 if not expires_at:
-                    return {**signed_in, "reason": "no_expiry_recorded"}
+                    return _signed_in_done({**signed_in, "reason": "no_expiry_recorded"})
                 if expires_at >= now_ms:
-                    return {**signed_in, "reason": "token_valid"}
+                    return _signed_in_done({**signed_in, "reason": "token_valid"})
                 if not oauth.get("refreshToken"):
                     payload = {**signed_out, "reason": "expired_no_refresh_token"}
                 else:
                     loop = asyncio.get_event_loop()
                     active = await loop.run_in_executor(None, _primary_turn_after, int(expires_at))
                     if active:
-                        return {**signed_in, "reason": "expired_but_session_active"}
+                        return _signed_in_done({**signed_in, "reason": "expired_but_session_active"})
                     payload = {**signed_out, "reason": "expired_no_activity_since"}
     except Exception:
         payload = {"authenticated": False, "account": None, "expires_at": None,
@@ -2358,11 +2390,9 @@ async def api_claude_auth_reconnect(request: Request) -> JSONResponse:
     sign-in flow would type into that session. The page shows a plain note."""
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    if request.method != "POST":
-        return JSONResponse({"error": "method not allowed"}, status_code=405)
     if _engine_is_managed():
         return JSONResponse({"error": "managed", "managed": True}, status_code=409)
-    if await _established_ai_running():
+    if await _established_ai_running(fresh=True):
         status = await _claude_auth_status_payload()
         return JSONResponse({**status, "live_session": True,
                              "reconnect": {"moved": False, "backup": None, "held": "live_session"}})
@@ -2395,11 +2425,12 @@ async def api_claude_auth_start(request: Request) -> JSONResponse:
     """
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    global _captured_oauth_url
-    if await _established_ai_running():
+    global _captured_oauth_url, _signin_flow_started_at
+    if await _established_ai_running(fresh=True):
         # t3383: the sign-in flow below types into the pane and, on retry,
         # stops every Claude process. Never run it over a working AI.
         return JSONResponse({"started": False, "live_session": True, "error": _LIVE_AI_MSG})
+    _signin_flow_started_at = time.time()
     _captured_oauth_url = None
     pane = await _find_primary_pane_async()
     _save_portal_message(f"Auth flow v2 started — {get_tmux_session()} (pane {pane})", role="assistant")
@@ -2421,7 +2452,7 @@ async def api_claude_auth_prewarm(request: Request) -> JSONResponse:
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     global _auth_prewarm_task
-    if await _established_ai_running():
+    if await _established_ai_running(fresh=True):
         # t3383: the sign-in flow below types into the pane and, on retry,
         # stops every Claude process. Never run it over a working AI.
         return JSONResponse({"started": False, "live_session": True, "error": _LIVE_AI_MSG})
@@ -2458,6 +2489,10 @@ async def api_claude_auth_code(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid json"}, status_code=400)
     if not code:
         return JSONResponse({"error": "empty code"}, status_code=400)
+    if await _established_ai_running(fresh=True):
+        # t3383: only type the code while the pane holds this sign-in flow's
+        # own `claude /login`, never into a working AI.
+        return JSONResponse({"error": _LIVE_AI_MSG, "live_session": True})
     pane = await _find_primary_pane_async()
     _save_portal_message(f"Auth code submitted — injecting into {get_tmux_session()}...", role="assistant")
     try:
