@@ -403,6 +403,8 @@ def private_tmux(tmp_path, monkeypatch):
             os.kill(int(pid), 15)
         except Exception:
             pass
+    # And the private tmux server itself (it outlived the test otherwise).
+    subprocess.run([real, "-S", str(sock), "kill-server"], capture_output=True)
 
 
 def _wait_for(pred, timeout=10.0):
