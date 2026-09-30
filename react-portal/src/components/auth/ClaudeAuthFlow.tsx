@@ -13,11 +13,15 @@ interface AuthStatusResponse {
   reason?: string
   /** Signed out, but an established AI is running right now. */
   live_session?: boolean
+  /** 'helper': this CIV signs in in a separate window; its AI is never touched. */
+  signin_mode?: 'helper'
 }
 
 interface StartResponse {
   started?: boolean
   error?: string
+  url?: string
+  mode?: 'helper'
 }
 
 interface UrlResponse {
@@ -28,6 +32,9 @@ interface UrlResponse {
 interface CodeResponse {
   injected?: boolean
   error?: string
+  mode?: 'helper'
+  /** helper sign-in only: 'signed_in' | 'failed' | 'pending' */
+  result?: string
 }
 
 type FlowStep =
@@ -39,7 +46,6 @@ type FlowStep =
   | 'submitting-code'
   | 'verifying'
   | 'success'
-  | 'live-note'
 
 export function ClaudeAuthFlow() {
   const [step, setStep] = useState<FlowStep>('checking')
@@ -47,7 +53,11 @@ export function ClaudeAuthFlow() {
   const [code, setCode] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [authenticated, setAuthenticated] = useState(false)
-  const [noteClosed, setNoteClosed] = useState(false)
+  // Established CIV: sign in through the portal's separate sign-in window, so
+  // the running AI is never typed into or stopped (t3383).
+  const [helperMode, setHelperMode] = useState(false)
+  const [live, setLive] = useState(false)
+  const [closed, setClosed] = useState(false)
 
   const urlPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const statusPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -76,11 +86,9 @@ export function ClaudeAuthFlow() {
         if (cancelled) return
         if (res.authenticated) {
           setAuthenticated(true)
-        } else if (res.live_session) {
-          // An established AI is running: the sign-in flow would type into
-          // it, so show a plain, closable note instead.
-          setStep('live-note')
         } else {
+          if (res.signin_mode === 'helper') setHelperMode(true)
+          if (res.live_session) setLive(true)
           setStep('idle')
         }
       })
@@ -94,10 +102,35 @@ export function ClaudeAuthFlow() {
     setError(null)
     setStep('starting')
     try {
+      // Check again at the click: the page may have loaded before an AI started.
+      let helper = helperMode
+      try {
+        const now = await apiGet<AuthStatusResponse>('/api/auth/status')
+        if (now.authenticated) {
+          setAuthenticated(true)
+          return
+        }
+        if (now.signin_mode === 'helper') {
+          helper = true
+          setHelperMode(true)
+        }
+        if (now.live_session) setLive(true)
+      } catch {
+        // The server decides the sign-in path again itself.
+      }
       const res = await apiPost<StartResponse>('/api/auth/start')
+      if (res.mode === 'helper') {
+        helper = true
+        setHelperMode(true)
+      }
       if (res.error) {
         setError(res.error)
         setStep('idle')
+        return
+      }
+      if (res.started && helper && res.url) {
+        setAuthUrl(res.url)
+        setStep('url-ready')
         return
       }
       if (res.started) {
@@ -123,7 +156,7 @@ export function ClaudeAuthFlow() {
       setError(err instanceof Error ? err.message : 'Failed to start authentication')
       setStep('idle')
     }
-  }, [])
+  }, [helperMode])
 
   const handleSubmitCode = useCallback(async () => {
     if (!code.trim()) return
@@ -133,10 +166,18 @@ export function ClaudeAuthFlow() {
       const res = await apiPost<CodeResponse>('/api/auth/code', { code: code.trim() })
       if (res.error) {
         setError(res.error)
-        setStep('url-ready')
+        setStep(res.mode === 'helper' ? 'idle' : 'url-ready')
+        return
+      }
+      if (res.mode === 'helper' && res.result === 'failed') {
+        setError("That code didn't work. Please start the sign-in again to get a new link.")
+        setCode('')
+        setAuthUrl(null)
+        setStep('idle')
         return
       }
       if (res.injected) {
+        const helper = helperMode || res.mode === 'helper'
         setStep('verifying')
         // Poll auth status
         statusPollRef.current = setInterval(async () => {
@@ -150,7 +191,9 @@ export function ClaudeAuthFlow() {
               // Auth confirmed — fire evolution and dismiss immediately.
               // Do NOT wait for evolution to complete (takes 10+ min).
               // Human watches evolution in terminal/chat.
-              fireFirstBoot().catch(() => {})
+              // Newborn only: an established CIV's AI keeps running and picks
+              // up the new sign-in itself.
+              if (!helper) fireFirstBoot().catch(() => {})
               setAuthenticated(true)
             }
           } catch {
@@ -162,41 +205,20 @@ export function ClaudeAuthFlow() {
       setError(err instanceof Error ? err.message : 'Failed to submit code')
       setStep('url-ready')
     }
-  }, [code])
+  }, [code, helperMode])
+
+  const handleClose = useCallback(() => {
+    clearPolls()
+    setClosed(true)
+    apiPost('/api/auth/close').catch(() => {})
+  }, [clearPolls])
 
   // triggerEvolution removed — fire-and-forget in submitCode, dismiss immediately
 
   // Render nothing if authenticated or skipped
   if (authenticated) return null
   if (step === 'checking') return null
-
-  if (step === 'live-note') {
-    if (noteClosed) return null
-    return (
-      <div className="claude-auth-overlay" role="dialog" aria-modal="true" aria-labelledby="claude-live-note-title">
-        <div className="claude-auth-box claude-live-note">
-          <div className="claude-auth-title" id="claude-live-note-title">Claude sign-in</div>
-          <div className="claude-auth-desc">
-            Your AI's Claude sign-in has expired or could not be confirmed, but your AI is still
-            running. The portal won't start a new sign-in while it runs, because that would
-            interrupt it.
-          </div>
-          <div className="claude-auth-note">
-            If your AI is answering you normally, you can close this note. If it isn't,
-            contact support and we'll reconnect it for you.
-          </div>
-          {SUPPORT_URL && (
-            <a className="claude-auth-link-inline" href={SUPPORT_URL} target="_blank" rel="noopener noreferrer">
-              {SUPPORT_LABEL}
-            </a>
-          )}
-          <button className="claude-auth-btn" onClick={() => setNoteClosed(true)} autoFocus>
-            Close
-          </button>
-        </div>
-      </div>
-    )
-  }
+  if (closed) return null
 
   return (
     <div className="claude-auth-overlay">
@@ -206,17 +228,33 @@ export function ClaudeAuthFlow() {
         ) : (
           <>
             <div className="claude-auth-icon">{'\uD83D\uDD10'}</div>
-            <div className="claude-auth-title">Connect Your Claude Account</div>
-            <div className="claude-auth-desc">
-              Claude needs to authenticate before it can run. This takes about 2 minutes.
-            </div>
-            <div className="claude-auth-note">
-              You'll be redirected to claude.ai to authorize.
-            </div>
+            {helperMode ? (
+              <>
+                <div className="claude-auth-title">Reconnect Claude</div>
+                <div className="claude-auth-desc">
+                  Your AI's Claude sign-in has expired or could not be confirmed. You can sign in
+                  again here. {live ? 'Your AI keeps running while you do; nothing is interrupted.' : 'Nothing on your AI is changed or restarted.'}
+                </div>
+                <div className="claude-auth-note">
+                  You'll be redirected to claude.ai to authorize. If your AI is answering you
+                  normally, you can close this.
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="claude-auth-title">Connect Your Claude Account</div>
+                <div className="claude-auth-desc">
+                  Claude needs to authenticate before it can run. This takes about 2 minutes.
+                </div>
+                <div className="claude-auth-note">
+                  You'll be redirected to claude.ai to authorize.
+                </div>
+              </>
+            )}
 
             {step === 'idle' && (
               <button className="claude-auth-btn" onClick={handleStart}>
-                Authenticate Now
+                {helperMode ? 'Sign in' : 'Authenticate Now'}
               </button>
             )}
 
@@ -279,6 +317,17 @@ export function ClaudeAuthFlow() {
             )}
 
             {error && <div className="claude-auth-error">{error}</div>}
+
+            {helperMode && step !== 'verifying' && (
+              <button className="claude-auth-btn claude-auth-close" onClick={handleClose}>
+                Not now
+              </button>
+            )}
+            {helperMode && SUPPORT_URL && (
+              <a className="claude-auth-link-inline" href={SUPPORT_URL} target="_blank" rel="noopener noreferrer">
+                {SUPPORT_LABEL}
+              </a>
+            )}
 
           </>
         )}

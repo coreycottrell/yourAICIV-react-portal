@@ -177,3 +177,10 @@
   color: var(--accent-primary);
   font-weight: 600;
 }
+
+.claude-auth-close {
+  margin-top: 12px;
+  background: transparent;
+  color: var(--text-secondary, inherit);
+  border: 1px solid var(--border-default);
+}

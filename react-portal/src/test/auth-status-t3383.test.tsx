@@ -34,20 +34,22 @@ describe('ClaudeAuthFlow honest status (t3383)', () => {
     expect(await screen.findByText('Authenticate Now')).toBeInTheDocument()
   })
 
-  it('signed out while an established AI runs: plain closable note, no sign-in button', async () => {
-    statusBody = { authenticated: false, reason: 'expired_no_activity_since', live_session: true }
+  it('signed out while an established AI runs: Reconnect dialog, closable, nothing started', async () => {
+    statusBody = { authenticated: false, reason: 'expired_no_activity_since', live_session: true, signin_mode: 'helper' }
     render(<ClaudeAuthFlow />)
-    expect(await screen.findByText(/still\s+running/)).toBeInTheDocument()
+    expect(await screen.findByText('Reconnect Claude')).toBeInTheDocument()
+    expect(screen.getByText(/keeps running/)).toBeInTheDocument()
     expect(screen.queryByText('Authenticate Now')).not.toBeInTheDocument()
-    fireEvent.click(screen.getByText('Close'))
-    await waitFor(() => expect(screen.queryByText(/still\s+running/)).not.toBeInTheDocument())
     expect(flowCalls()).toHaveLength(0)
+    fireEvent.click(screen.getByText('Not now'))
+    await waitFor(() => expect(screen.queryByText('Reconnect Claude')).not.toBeInTheDocument())
+    expect(flowCalls()).toEqual(['POST /api/auth/close'])
   })
 
   it('signed in: renders nothing', async () => {
     render(<ClaudeAuthFlow />)
     await waitFor(() => expect(calls).toContain('GET /api/auth/status'))
     expect(screen.queryByText('Connect Your Claude Account')).not.toBeInTheDocument()
-    expect(screen.queryByText(/still\s+running/)).not.toBeInTheDocument()
+    expect(screen.queryByText('Reconnect Claude')).not.toBeInTheDocument()
   })
 })
