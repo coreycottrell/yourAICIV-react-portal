@@ -1,0 +1,43 @@
+.reconnect-claude {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.reconnect-claude-btn {
+  padding: 6px 12px;
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.reconnect-claude-btn:hover:not(:disabled) {
+  color: var(--accent-primary);
+  border-color: var(--accent-primary);
+}
+
+.reconnect-claude-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.reconnect-claude-error {
+  font-size: 12px;
+  color: var(--status-error, #e5534b);
+}
+
+@media (max-width: 640px) {
+  .reconnect-claude--header .reconnect-claude-btn {
+    padding: 4px 8px;
+    font-size: 12px;
+  }
+  .reconnect-claude--header .reconnect-claude-error {
+    display: none;
+  }
+}

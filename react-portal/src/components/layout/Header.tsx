@@ -3,6 +3,7 @@ import { useIdentityStore } from '../../stores/identityStore'
 import { StatusBadge } from '../common/StatusBadge'
 import { BrandMark } from '../brand/BrandMark'
 import { TrialBadge } from '../trial/TrialBadge'
+import { ReconnectClaudeButton } from '../auth/ReconnectClaudeButton'
 import './Header.css'
 
 export function Header() {
@@ -24,6 +25,7 @@ export function Header() {
       </div>
       <div className="header-right">
         <TrialBadge />
+        <ReconnectClaudeButton variant="header" />
         <StatusBadge
           status={online ? 'online' : 'offline'}
           label={online ? 'Working' : 'Offline'}

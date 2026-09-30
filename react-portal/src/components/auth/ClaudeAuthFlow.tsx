@@ -1,14 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { apiGet, apiPost } from '../../api/client'
 import { fireFirstBoot } from '../../api/evolution'
+import { SUPPORT_URL, SUPPORT_LABEL } from '../../utils/brand'
+import { CLAUDE_AUTH_STATUS_EVENT } from './claudeAuthStatus'
+import type { ClaudeAuthStatus } from './claudeAuthStatus'
 import './ClaudeAuthFlow.css'
 
-interface AuthStatusResponse {
-  authenticated: boolean
-  account?: string | null
-  expires_at?: number | null
-  subscription?: string | null
-}
+type AuthStatusResponse = ClaudeAuthStatus
 
 interface StartResponse {
   started?: boolean
@@ -34,6 +32,10 @@ type FlowStep =
   | 'submitting-code'
   | 'verifying'
   | 'success'
+  | 'live-note'
+
+// Steps where a sign-in is under way; a status event must not reset them.
+const IN_FLOW_STEPS: FlowStep[] = ['starting', 'polling-url', 'url-ready', 'submitting-code', 'verifying']
 
 export function ClaudeAuthFlow() {
   const [step, setStep] = useState<FlowStep>('checking')
@@ -41,6 +43,10 @@ export function ClaudeAuthFlow() {
   const [code, setCode] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [authenticated, setAuthenticated] = useState(false)
+  const [liveReason, setLiveReason] = useState<string | undefined>(undefined)
+  const [noteDismissed, setNoteDismissed] = useState(false)
+  const stepRef = useRef<FlowStep>('checking')
+  useEffect(() => { stepRef.current = step }, [step])
 
   const urlPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const statusPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -69,6 +75,11 @@ export function ClaudeAuthFlow() {
         if (cancelled) return
         if (res.authenticated) {
           setAuthenticated(true)
+        } else if (res.live_session) {
+          // An established AI is running in its session: the sign-in flow
+          // would type into it, so show a plain note instead.
+          setLiveReason(res.reason)
+          setStep('live-note')
         } else {
           setStep('idle')
         }
@@ -77,6 +88,30 @@ export function ClaudeAuthFlow() {
         if (!cancelled) setStep('idle')
       })
     return () => { cancelled = true }
+  }, [])
+
+  // Status handed over by the Reconnect Claude button.
+  useEffect(() => {
+    const onStatus = (e: Event) => {
+      const res = (e as CustomEvent<AuthStatusResponse>).detail
+      if (!res || typeof res.authenticated !== 'boolean') return
+      if (IN_FLOW_STEPS.includes(stepRef.current)) return
+      setError(null)
+      setNoteDismissed(false)
+      if (res.authenticated) {
+        setAuthenticated(true)
+        return
+      }
+      setAuthenticated(false)
+      if (res.live_session) {
+        setLiveReason(res.reason)
+        setStep('live-note')
+      } else {
+        setStep('idle')
+      }
+    }
+    window.addEventListener(CLAUDE_AUTH_STATUS_EVENT, onStatus)
+    return () => window.removeEventListener(CLAUDE_AUTH_STATUS_EVENT, onStatus)
   }, [])
 
   const handleStart = useCallback(async () => {
@@ -158,6 +193,36 @@ export function ClaudeAuthFlow() {
   // Render nothing if authenticated or skipped
   if (authenticated) return null
   if (step === 'checking') return null
+
+  if (step === 'live-note') {
+    if (noteDismissed) return null
+    const signedOut = liveReason === 'no_credentials'
+    return (
+      <div className="claude-auth-overlay" role="dialog" aria-modal="true" aria-labelledby="claude-live-note-title">
+        <div className="claude-auth-box claude-live-note">
+          <div className="claude-auth-title" id="claude-live-note-title">Claude sign-in</div>
+          <div className="claude-auth-desc">
+            {signedOut
+              ? 'Claude has been signed out on your AI, but your AI is still running.'
+              : "Your AI's Claude sign-in has expired or could not be confirmed, but your AI is still running."}
+            {' '}The portal won't start a new sign-in while it runs, because that would interrupt it.
+          </div>
+          <div className="claude-auth-note">
+            If your AI is answering you normally, you can close this note. If it isn't,
+            contact support and we'll reconnect it for you.
+          </div>
+          {SUPPORT_URL && (
+            <a className="claude-auth-link-inline" href={SUPPORT_URL} target="_blank" rel="noopener noreferrer">
+              {SUPPORT_LABEL}
+            </a>
+          )}
+          <button className="claude-auth-btn" onClick={() => setNoteDismissed(true)} autoFocus>
+            Close
+          </button>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="claude-auth-overlay">
