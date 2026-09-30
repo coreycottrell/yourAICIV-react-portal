@@ -35,6 +35,8 @@ interface CodeResponse {
   mode?: 'helper'
   /** helper sign-in only: 'signed_in' | 'failed' | 'pending' */
   result?: string
+  /** helper sign-in only: a working AI is running to pick up the new sign-in */
+  ai_running?: boolean
 }
 
 type FlowStep =
@@ -173,6 +175,7 @@ export function ClaudeAuthFlow() {
       }
       if (res.injected) {
         const helper = helperMode || res.mode === 'helper'
+        const noAi = helper && res.ai_running === false
         setStep('verifying')
         // Poll auth status
         statusPollRef.current = setInterval(async () => {
@@ -188,7 +191,7 @@ export function ClaudeAuthFlow() {
               // Human watches evolution in terminal/chat.
               // The server fires it only for a newborn (t3383).
               fireFirstBoot().catch(() => {})
-              if (helper && !statusRes.live_session && !live) {
+              if (noAi) {
                 // Signed in, but no AI was running to pick it up: say so.
                 setStep('success')
                 return
@@ -204,7 +207,7 @@ export function ClaudeAuthFlow() {
       setError(err instanceof Error ? err.message : 'Failed to submit code')
       setStep('url-ready')
     }
-  }, [code, helperMode, live])
+  }, [code, helperMode])
 
   const handleClose = useCallback(() => {
     clearPolls()

@@ -366,3 +366,71 @@ def test_close_helper_kills_only_the_helper_tree(portal, monkeypatch):
             except ProcessLookupError:
                 pass
             p.wait()
+
+
+def test_established_by_a_turn_in_another_project_dir(portal):
+    """Review r1 #1: an AI launched from another folder has worked; never a newborn."""
+    mod, home, _ = portal
+    other = mod._PROJECTS_DIR / "-home-aiciv-civ"
+    other.mkdir(parents=True)
+    (other / "s.jsonl").write_text(json.dumps(_turn()) + "\n")
+    assert mod._civ_is_established()
+    r = TestClient(mod.app).post("/api/evolution/first-boot", headers=H).json()
+    assert r == {"status": "skipped_not_newborn"} and not mod.FIRST_BOOT_MARKER.exists()
+
+
+def test_established_despite_many_error_only_sessions_and_a_late_first_turn(portal):
+    """Review r1 #2/#3: 30 newer error-only sessions, and the real turn after 1.5MB."""
+    mod, home, _ = portal
+    d = _primary_dir(mod)
+    big = json.dumps({"type": "user", "message": {"content": "x" * (1536 * 1024)}})
+    old = d / "old.jsonl"
+    old.write_text(big + "\n" + json.dumps(_turn()) + "\n")
+    os.utime(old, (1_000_000, 1_000_000))
+    for i in range(30):
+        (d / f"err{i}.jsonl").write_text(json.dumps(_turn(isApiErrorMessage=True)) + "\n")
+    assert mod._primary_has_real_turn()
+
+
+def test_auth_login_detection_failure_is_not_cached(portal, monkeypatch):
+    mod, home, _ = portal
+    monkeypatch.setattr(mod, "_find_claude_binary", lambda: "/x/claude")
+    outs = iter(["", "Commands:\n  login [options]   Sign in\n"])
+
+    async def fake_out(cmd, timeout=5):
+        return next(outs)
+    monkeypatch.setattr(mod, "_run_subprocess_output", fake_out)
+    argv1, _ = asyncio.run(mod._signin_helper_argv())
+    argv2, _ = asyncio.run(mod._signin_helper_argv())
+    assert argv1 == ["/x/claude", "/login"] and argv2 == ["/x/claude", "auth", "login"]
+    assert mod._signin_helper_has_auth_login is True
+
+
+def test_guard_also_covers_clear_history_and_resize(portal):
+    sys.modules.pop("portal_server", None)
+    import portal_server as ps
+    assert ps._is_send_keys(["tmux", "clear-history", "-t", "%1"])
+    assert ps._is_send_keys(["tmux", "resize-window", "-t", "%1", "-x", "500"])
+    assert ps._is_send_keys(["tmux", "send-keys", "-t", "%1", "x"])
+    assert not ps._is_send_keys(["tmux", "capture-pane", "-p", "-t", "%1"])
+
+
+def test_newborn_start_closes_a_leftover_helper_first(portal, monkeypatch):
+    mod, home, _ = portal
+    order = []
+
+    async def fake_close(reason):
+        order.append(("close", reason))
+        return True
+
+    async def fake_sm(pane):
+        order.append(("flow", pane))
+        return {"started": True}
+
+    async def primary():
+        return "%7"
+    monkeypatch.setattr(mod, "_close_signin_helper", fake_close)
+    monkeypatch.setattr(mod, "_run_auth_state_machine", fake_sm)
+    monkeypatch.setattr(mod, "_find_primary_pane_async", primary)
+    assert TestClient(mod.app).post("/api/auth/start", headers=H).json() == {"started": True}
+    assert order == [("close", "newborn sign-in"), ("flow", "%7")]

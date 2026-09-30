@@ -83,7 +83,7 @@ describe('sign-in through the helper window (t3383)', () => {
       { authenticated: true },
     ]
     startBody = { started: true, url: URL, mode: 'helper' }
-    codeBody = { injected: true, mode: 'helper', result: 'signed_in' }
+    codeBody = { injected: true, mode: 'helper', result: 'signed_in', ai_running: false }
     render(<ClaudeAuthFlow />)
     fireEvent.click(await screen.findByText('Sign in'))
     fireEvent.change(await screen.findByPlaceholderText('eyJh...'), { target: { value: 'abc' } })

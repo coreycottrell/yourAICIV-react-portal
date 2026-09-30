@@ -2306,9 +2306,10 @@ class _SigninGuardStop(Exception):
 
 
 def _is_send_keys(cmd) -> bool:
+    """A tmux command that types into or changes a pane (keys, scrollback clear, resize)."""
     return (isinstance(cmd, (list, tuple)) and len(cmd) > 1
             and os.path.basename(str(cmd[0])) == "tmux"
-            and "send-keys" in [str(c) for c in cmd[1:]])
+            and any(str(c) in ("send-keys", "clear-history", "resize-window") for c in cmd[1:3]))
 
 
 def _argv_is_signin_only(argv: list) -> bool:
@@ -2363,23 +2364,30 @@ def _ai_processes_sync():
     return found
 
 
+_REAL_TURN_FILE_CAP = 64 * 1024 * 1024
+_established_seen = False
+
+
 def _file_has_real_turn(path: Path) -> bool:
+    """The transcript holds a real interactive turn anywhere in it. Streams
+    the file line by line (up to 64MB); a positive answer never changes."""
     try:
         st = path.stat()
     except OSError:
         return False
     key = (str(path), st.st_mtime_ns, st.st_size)
-    if key in _real_turn_cache:
-        return _real_turn_cache[key]
+    if _real_turn_cache.get(str(path)) is True or key in _real_turn_cache:
+        return _real_turn_cache.get(str(path)) is True or _real_turn_cache[key]
     found = False
     try:
+        read = 0
         with path.open("rb") as f:
-            chunks = [f.read(1024 * 1024)]
-            if st.st_size > 2 * 1024 * 1024:
-                f.seek(st.st_size - 1024 * 1024)
-                chunks.append(f.read())
-        for chunk in chunks:
-            for raw in chunk.split(b"\n"):
+            for raw in f:
+                read += len(raw)
+                if read > _REAL_TURN_FILE_CAP:
+                    break
+                if b'"assistant"' not in raw:
+                    continue
                 try:
                     entry = json.loads(raw)
                 except (ValueError, UnicodeDecodeError):
@@ -2387,25 +2395,49 @@ def _file_has_real_turn(path: Path) -> bool:
                 if isinstance(entry, dict) and _is_real_primary_turn(entry):
                     found = True
                     break
-            if found:
-                break
     except OSError:
         found = False
-    if len(_real_turn_cache) > 256:
+    if len(_real_turn_cache) > 4096:
         _real_turn_cache.clear()
     _real_turn_cache[key] = found
+    if found:
+        _real_turn_cache[str(path)] = True
     return found
 
 
 def _primary_has_real_turn() -> bool:
-    """The primary session has made at least one real turn (the CIV has
-    worked here before, even with no first-boot or evolution marker)."""
+    """This CIV has made at least one real interactive turn, in the primary
+    project or any other project dir (an AI launched from another folder).
+    Headless (sdk-*) and subagent turns never count. Once true, stays true."""
+    global _established_seen
+    if _established_seen:
+        return True
     try:
-        files = sorted(((jf.stat().st_mtime, jf) for jf in _primary_project_dir().glob("*.jsonl")
-                        if jf.is_file()), key=lambda x: x[0], reverse=True)
+        files = []
+        for d in [_primary_project_dir()] + sorted(p for p in _PROJECTS_DIR.iterdir() if p.is_dir()):
+            for jf in d.glob("*.jsonl"):
+                try:
+                    if jf.is_file():
+                        files.append((jf.stat().st_mtime, jf))
+                except OSError:
+                    continue
     except OSError:
         return False
-    return any(_file_has_real_turn(jf) for _, jf in files[:20])
+    files.sort(key=lambda x: x[0])          # oldest first: early sessions did the work
+    seen = set()
+    for _, jf in files[:5000]:
+        if jf in seen:
+            continue
+        seen.add(jf)
+        if _file_has_real_turn(jf):
+            _established_seen = True
+            return True
+    return False
+
+
+def _signin_facts_sync():
+    """(established, working-AI pids or None)."""
+    return _civ_is_established(), _ai_processes_sync()
 
 
 def _signin_mode_sync() -> str:
@@ -2530,13 +2562,20 @@ async def _close_signin_helper(reason: str) -> bool:
     root_argv = _proc_argv(root) or []
     if not hp["dead"] and root_argv and _argv_is_signin_only(root_argv):
         protected = (await _primary_pane_pids()) | {os.getpid()}
+        snapshot = {}
+        for pid in await loop.run_in_executor(None, _descendants_sync, root):
+            argv = _proc_argv(pid)
+            if argv is not None and pid not in protected:
+                snapshot[pid] = argv
         for sig in (signal.SIGTERM, signal.SIGKILL):
-            targets = await loop.run_in_executor(None, _descendants_sync, root)
-            for pid in sorted(targets - protected, reverse=True):
-                # Check again right before this kill: still under the helper,
-                # not the AI's pane, and not a working Claude.
+            for pid in sorted(snapshot, reverse=True):
+                # Check again right before this kill: same process as in the
+                # helper's tree (same argv, still under the helper or orphaned),
+                # not the AI's pane, and never a working Claude.
                 argv = _proc_argv(pid)
-                if pid in protected or not _is_under(pid, root) or argv is None:
+                if argv is None or argv != snapshot[pid] or pid in protected:
+                    continue
+                if not (_is_under(pid, root) or _ppid(pid) == 1):
                     continue
                 if _argv_is_claude(argv) and not _argv_is_signin_only(argv):
                     continue
@@ -2546,9 +2585,9 @@ async def _close_signin_helper(reason: str) -> bool:
                     pass
             for _ in range(10):
                 await asyncio.sleep(0.2)
-                if not Path(f"/proc/{root}").exists():
+                if not any(Path(f"/proc/{pid}").exists() for pid in snapshot):
                     break
-            if not Path(f"/proc/{root}").exists():
+            if not any(Path(f"/proc/{pid}").exists() for pid in snapshot):
                 break
     hp2 = await _signin_helper_pane()
     if hp2 is not None and hp2["pane_id"] == hp["pane_id"]:
@@ -2585,10 +2624,13 @@ async def _signin_helper_argv():
             import pwd
             prefix = [runuser, "-u", pwd.getpwuid(owner).pw_name, "--",
                       "env", f"HOME={Path.home()}"]
-    if _signin_helper_has_auth_login is None:
-        out = await _run_subprocess_output(prefix + [claude, "auth", "--help"], timeout=15)
-        _signin_helper_has_auth_login = bool(re.search(r"^\s+login\b", out or "", re.MULTILINE))
-    if _signin_helper_has_auth_login:
+    has_auth_login = _signin_helper_has_auth_login
+    if has_auth_login is None:
+        out = await _run_subprocess_output(prefix + [claude, "auth", "--help"], timeout=30)
+        has_auth_login = bool(re.search(r"^\s+login\b", out or "", re.MULTILINE))
+        if out:                              # cache only a real answer
+            _signin_helper_has_auth_login = has_auth_login
+    if has_auth_login:
         return prefix + [claude, "auth", "login"], None
     return prefix + [claude, "/login"], None
 
@@ -2684,8 +2726,8 @@ async def _signin_helper_submit_code(code: str) -> dict:
             hp = await _signin_helper_pane()
             finished = hp is None or hp["dead"]
             if not finished:
-                screen, _content = await _detect_auth_screen(hp["pane_id"])
-                finished = screen == "logged_in"
+                _screen, content = await _detect_auth_screen(hp["pane_id"])
+                finished = bool(AUTH_SCREEN_PATTERNS["logged_in"].search(content or ""))
             if not finished:
                 continue    # never stop the helper mid-exchange
             now_fp = _creds_fingerprint()
@@ -2698,7 +2740,10 @@ async def _signin_helper_submit_code(code: str) -> dict:
         elif result == "failed":
             await _close_signin_helper("sign-in failed")
         _save_portal_message(f"[signin-helper] code submitted: {result}", role="assistant")
-        return {"injected": True, "mode": "helper", "result": result}
+        loop = asyncio.get_event_loop()
+        ai = await loop.run_in_executor(None, _ai_processes_sync)
+        return {"injected": True, "mode": "helper", "result": result,
+                "ai_running": ai is None or len(ai) > 0}
 
 
 async def _claude_auth_status_payload() -> dict:
@@ -2748,17 +2793,17 @@ async def _claude_auth_status_payload() -> dict:
     # Signed out: say whether an established CIV's AI is running, so the page
     # shows a plain note instead of the sign-in flow (that flow types into the
     # AI's pane and, on retry, stops every Claude). A newborn never gets this.
-    try:
-        payload["live_session"] = await _established_ai_running()
-    except Exception:
-        payload["live_session"] = False
-    # t3383: this CIV signs in through the helper session (never the AI's
-    # pane). Absent for a newborn, whose payload is unchanged.
+    # t3383: one read of the facts; signin_mode is absent for a newborn,
+    # whose payload is unchanged.
     try:
         loop = asyncio.get_event_loop()
-        if await loop.run_in_executor(None, _signin_mode_sync) == "helper":
+        established, ai = await loop.run_in_executor(None, _signin_facts_sync)
+        ai_running = ai is None or len(ai) > 0
+        payload["live_session"] = established and ai_running
+        if established or ai_running:
             payload["signin_mode"] = "helper"
     except Exception:
+        payload["live_session"] = False
         payload["signin_mode"] = "helper"
     return payload
 
@@ -2793,6 +2838,10 @@ async def api_claude_auth_start(request: Request) -> JSONResponse:
         except Exception as e:
             _save_portal_message(f"Sign-in helper failed: {e}", role="assistant")
             return JSONResponse({"error": f"auth flow error: {e}", "mode": "helper"}, status_code=500)
+    # A leftover helper would catch the code meant for this flow: close it
+    # (the helper's own processes only).
+    async with _signin_helper_lock():
+        await _close_signin_helper("newborn sign-in")
     pane = await _find_primary_pane_async()
     _save_portal_message(f"Auth flow v2 started — {get_tmux_session()} (pane {pane})", role="assistant")
     guard = _newborn_flow_guard.set(True)
@@ -2993,8 +3042,10 @@ async def api_evolution_first_boot(request: Request) -> JSONResponse:
         return JSONResponse({"status": "already_evolved"})
     if FIRST_BOOT_MARKER.exists():
         return JSONResponse({"status": "already_fired"})
-    # t3383: a CIV with no marker whose primary has already worked is not a
-    # newborn: never stop its AI or type an awakening into it.
+    # t3383: a CIV with no marker that has already worked (any real turn, in
+    # any project) is not a newborn: never stop its AI or type an awakening
+    # into it. A Claude that has never made a turn has no work to lose, so a
+    # newborn with a stray, never-used Claude still gets main's awakening.
     loop = asyncio.get_event_loop()
     if await loop.run_in_executor(None, _primary_has_real_turn):
         return JSONResponse({"status": "skipped_not_newborn"})
